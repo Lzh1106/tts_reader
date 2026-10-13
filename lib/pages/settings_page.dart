@@ -26,7 +26,17 @@ import 'text_rules_page.dart';
 
 /// 设置页：外观、朗读引擎、云端配置、语音、语速与音调
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({super.key, this.onOpenUrl});
+
+  /// 「项目主页」这类外链的打开方式（由 [HomePage] 注入：切到浏览器 Tab 再打开）
+  ///
+  /// ⚠️ 之所以走**应用内浏览器**而不是 `url_launcher`：本工程没有那个依赖
+  /// （也不打算为一个按钮加依赖），而应用自带一个完整浏览器 ——
+  /// 点一下就切到浏览器 Tab 打开，用户还能顺手收藏 / 复制。
+  final void Function(String url)? onOpenUrl;
+
+  /// 项目在 GitHub 上的主页（设置页底部那个按钮的目标）
+  static const String projectHomeUrl = 'https://github.com/Lzh1106/tts_reader';
 
   /// 外观设置里的关键控件（用例据此定位）
   static const Key dynamicColorKey = ValueKey<String>('settings-dynamic-color');
@@ -75,12 +85,24 @@ class SettingsPage extends StatefulWidget {
   /// 文案改错一次不容易被发现（要滚到设置页底部才看得到），
   /// 所以把它抽成公开纯函数，让用例能直接钉住"子文件夹名只出现一次"。
   @visibleForTesting
-  static String downloadPathHint(String inboxPath) =>
-      '网页下载的书都放在：$inboxPath/\n'
-      '这是系统公共「下载」目录下的一个专属文件夹，'
-      '文件管理器里直接能看到，卸载本应用也不会删掉。\n'
-      '（下载器只能先下到「下载」根目录，下完再挪进这个子文件夹；'
-      '同一存储区内的移动是瞬间完成的，不会多占一份空间。）';
+  static String downloadPathHint(String inboxPath, {String customPath = ''}) {
+    // ★v1.21.44：选了自定义文件夹时，下面那段"都放在系统下载目录下的专属文件夹"
+    // 就是**错的**（文件会落到用户自选的目录）—— 说明文案必须跟着落点变。
+    //
+    // 方案 B：自定义生效时说明**两件事** —— ① 现在用的是自定义位置
+    // ② 不再走"下完再挪进专属子文件夹"那一步（那是公共「下载」目录特有的流程）。
+    if (customPath.isNotEmpty) {
+      return '当前使用自定义保存位置：$customPath/\n'
+          '文件直接下载到这里，不再收纳到软件专属子文件夹。\n'
+          '卸载本应用不会删掉这个文件夹里的书；'
+          '若该文件夹被删除或不可写，下载会自动回退到应用私有目录并提示。';
+    }
+    return '网页下载的书都放在：$inboxPath/\n'
+        '这是系统公共「下载」目录下的一个专属文件夹，'
+        '文件管理器里直接能看到，卸载本应用也不会删掉。\n'
+        '（下载器只能先下到「下载」根目录，下完再挪进这个子文件夹；'
+        '同一存储区内的移动是瞬间完成的，不会多占一份空间。）';
+  }
 
   /// 「恢复默认」按钮的 tooltip（**纯函数，可单测**）
   ///
@@ -111,20 +133,27 @@ class _SettingsPageState extends State<SettingsPage> {
     unawaited(_loadDownloadPath());
   }
 
-  /// 解析下载路径（进页面时调一次）
+  /// 解析下载路径（进页面时调一次，改过设置后也会再调）
   ///
-  /// v1.21.43（块3）：显示的是 **`downloadInboxPath`**（公共「下载」+ 软件专属
-  /// 子文件夹）—— 那是书**最终待的地方**，也是 📂 会导航到的位置。
-  /// 不要显示 `downloadPath`（那是下载器直写的根目录，用户不关心）。
+  /// 显示的是「**文件最终待的地方**」，按当前生效的保存位置二选一：
+  /// * 设过自定义文件夹 → **显示自定义路径**（否则用户看不出自定义有没有生效）；
+  /// * 否则 → `downloadInboxPath`（公共「下载」+ 软件专属子文件夹），
+  ///   那也是 📂 面板会导航到的位置。
+  ///
+  /// ⚠️ 这里**不**显示 `StorageService.downloadPath`：它是"下载器直写位置"
+  /// （公共下载时等于「下载」根目录），与"书最终在哪"不是一回事，别混用。
   Future<void> _loadDownloadPath() async {
     if (!mounted || _downloadPathLoading) return;
     _downloadPathLoading = true;
-    setState(() =>
-        _downloadPath ??= StorageService.instance.downloadInboxPath);
+    final storage = StorageService.instance;
+    String shown() => storage.hasCustomDownloadPath
+        ? storage.customDownloadPath
+        : storage.downloadInboxPath;
+    setState(() => _downloadPath ??= shown());
     try {
-      // 路径现在是常量，不需要真的去解析；保留这个 await 是为了
+      // 路径都是现成的字符串，不需要真的去解析；保留这个 await 是为了
       // 让"加载中"状态与既有调用点（进页面时 unawaited）保持一致。
-      final resolved = StorageService.instance.downloadInboxPath;
+      final resolved = shown();
       if (!mounted) return;
       setState(() => _downloadPath = resolved);
     } finally {
@@ -159,6 +188,8 @@ class _SettingsPageState extends State<SettingsPage> {
           _browseCard(),
           _tipsCard(tts),
           _diagnosticsCard(),
+          // ★项目主页放在**最底部、居中**（用户要求：诊断日志提示的下方）
+          _projectEntry(),
         ],
       ),
     );
@@ -1406,7 +1437,8 @@ class _SettingsPageState extends State<SettingsPage> {
         children: <Widget>[
           ListTile(
             leading: const Icon(Icons.download_outlined),
-            title: const Text('保存位置'),
+            // ★v1.21.44：把「当前来源」显示出来（自定义文件夹 / 系统下载目录 / 应用私有目录）
+            title: Text('保存位置（${storage.downloadTarget.label}）'),
             // 路径可能很长：等宽字体 + 自动换行，别被 ellipsis 截成看不出是哪个目录
             subtitle: Text(
               path,
@@ -1455,7 +1487,8 @@ class _SettingsPageState extends State<SettingsPage> {
               //
               // 文案本身在 [SettingsPage.downloadPathHint]（纯函数、可单测）：
               // 本轮（需求一）修的就是它原来把子文件夹名拼了两遍的问题。
-              SettingsPage.downloadPathHint(inbox),
+              SettingsPage.downloadPathHint(inbox,
+                  customPath: storage.customDownloadPath),
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ),
@@ -1477,7 +1510,65 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   /// 📂 拉起系统文件夹选择器（Android = `ACTION_OPEN_DOCUMENT_TREE`，即「使用此文件夹」）
+  ///
+  /// ## Android 11+ 的「所有文件访问」前置流程（v1.21.44）
+  ///
+  /// 想选应用私有目录 / 系统「下载」目录**之外**的任意文件夹，系统要求本应用先拿到
+  /// 「所有文件访问」权限（`MANAGE_EXTERNAL_STORAGE`）。而这个权限**没有弹窗申请**
+  /// 这条路 —— 只能：
+  ///
+  /// 1. 先查（[StorageService.hasAllFilesAccess]）；
+  /// 2. 没授权 → 弹一段说明，让用户明白为什么要授权；
+  /// 3. 点「去授权」→ 跳系统设置页（[StorageService.requestAllFilesAccess]）；
+  /// 4. 用户回来 → **重新查一次**（不能假设他一定开了）；
+  /// 5. 拿到了才拉文件夹选择器。
+  ///
+  /// Android 10 及以下没有这个开关（`hasAllFilesAccess` 恒为 true），流程自动跳过。
   Future<void> _pickDownloadFolder() async {
+    // ① 权限检查（Android 11+）—— 没权限就别拉选择器，否则用户选完也是白选
+    if (!await StorageService.hasAllFilesAccess()) {
+      if (!mounted) return;
+      final bool? agreed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('需要「所有文件访问」权限'),
+          content: const Text(
+            '要自选下载文件夹（内部存储或 SD 卡上的任意目录），'
+            '系统要求本应用获得「所有文件访问」权限。\n\n'
+            '点「去授权」会跳到系统设置页，在里面打开开关即可；'
+            '返回本应用后会自动继续。\n\n'
+            '授权后本应用可以读写整个存储空间。'
+            '不想授权就继续用「应用私有目录」或「系统下载目录」。',
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('去授权'),
+            ),
+          ],
+        ),
+      );
+      if (agreed != true || !mounted) return;
+
+      // ② 跳系统设置页
+      await StorageService.requestAllFilesAccess();
+      if (!mounted) return;
+
+      // ③ 回来重新查（用户可能没开就返回了）
+      if (!await StorageService.hasAllFilesAccess()) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('未获得权限，无法自选文件夹')),
+        );
+        return;
+      }
+      if (!mounted) return;
+    }
+
     String? picked;
     try {
       picked = await FilePicker.platform.getDirectoryPath(
@@ -1491,35 +1582,46 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       return;
     }
-    if (picked == null || picked.trim().isEmpty) return; // 用户取消
+    if (picked == null || picked.trim().isEmpty) return; // 用户取消：什么都不改
     if (!mounted) return;
 
-    if (!await _isWritableAppPrivatePath(picked)) {
+    // ★v1.21.44：判据放开 —— 只要**是文件系统路径**就接受，能不能写**当场实测**。
+    //
+    // 以前这里只认"应用私有目录之内"（[StorageService.isUnderAnyBase]），
+    // 而系统文件选择器进不去应用私有目录（它在 `/data/user/0/…` 下）——
+    // 于是"自定义文件夹"实际上永远选不成，文案只能写"只有部分机型可用"。
+    // 现在：`content://` 这类 URI 仍然拒（下载器只吃真实路径）；普通路径交给
+    // [StorageService.isUsableCustomDir]（基准内直接过 / 外部路径真写探针实测）。
+    final bool isFsPath = StorageService.isFilesystemPath(picked);
+    final bool usable = isFsPath && await StorageService.isUsableCustomDir(picked);
+    if (!usable) {
       if (!mounted) return;
-      // ⚠️ 不静默接受：公共目录的自定义子路径根本写不进去（见 _downloadCard 注释）
-      //
-      // v1.21.40：分两种情况给提示。
-      // 原来只有一句"只能选应用私有目录"——而**应用私有目录在 SAF 里根本进不去**
-      // （它在 `/data/user/0/…` 下），照那句话用户永远选不对。
-      // 所以：选到存储根就说"请进具体文件夹"；选到公共子目录才诚实说"不支持"。
+      // ⚠️ 不静默接受：写不进去的目录必须当场说清楚（否则用户只会在下载时看到"失败"）
       final bool atStorageRoot = SettingsPage.isPublicStorageRoot(picked);
       await showDialog<void>(
         context: context,
         builder: (dialogContext) => AlertDialog(
-          title: Text(atStorageRoot ? '请先进入具体文件夹' : '这个位置用不了'),
+          title: Text(
+            !isFsPath
+                ? '这个位置用不了'
+                : (atStorageRoot ? '请先进入具体文件夹' : '系统不允许写这个位置'),
+          ),
           content: Text(
-            atStorageRoot
-                ? '你选的是存储根目录：\n$picked\n\n'
-                    '请点进一个具体的文件夹（或者先新建一个）再点「使用此文件夹」。\n\n'
-                    '不过要说明：能自定义的只有本应用自己的目录，'
-                    '外面的位置都存不进去。'
-                : '选中的是：\n$picked\n\n'
-                    '这个位置没法用：下载器写系统「下载」目录时走的是系统媒体库，'
-                    '会忽略我们给的子文件夹，固定落在「下载」根目录。\n\n'
-                    '现在只能自定义本应用自己目录里的文件夹，'
-                    '而那个目录在系统文件选择器里进不去 —— '
-                    '所以自定义文件夹这条路，实际上只有部分机型可用。\n\n'
-                    '点「好」后仍按默认位置保存（系统「下载」目录）。',
+            !isFsPath
+                ? '选中的是：\n$picked\n\n'
+                    '系统文件选择器返回了特殊地址，无法作为下载位置。\n\n'
+                    '请改选「内部存储」或「SD 卡」上的具体文件夹。'
+                : (atStorageRoot
+                    ? '你选的是存储根目录：\n$picked\n\n'
+                        '请点进一个具体的文件夹（或者先新建一个）再点「使用此文件夹」。'
+                    : '选中的是：\n$picked\n\n'
+                        '应用往这里写文件被系统拒绝了。\n\n'
+                        '常见原因：\n'
+                        '· 「所有文件访问」权限被关掉了（系统设置里可以重新打开）；\n'
+                        '· 这个文件夹是只读的（例如 SD 卡的某些分区）或已被删除。\n\n'
+                        '也可以先改用下面两个位置之一：\n'
+                        '· 系统下载目录（文件管理器可见）\n'
+                        '· 应用私有目录（免权限，但文件管理器看不到）'),
           ),
           actions: <Widget>[
             FilledButton(
@@ -1544,14 +1646,6 @@ class _SettingsPageState extends State<SettingsPage> {
 
 
 
-  /// 这个路径是不是**应用能直接写**的私有目录
-  ///
-  /// 判据实现在 [StorageService.isUnderAnyBase]（纯字符串逻辑、可单测），  /// 浏览器页下载时用的是**同一份**判据 —— 两处不能各写一套，否则迟早漂移。
-  Future<bool> _isWritableAppPrivatePath(String path) async {
-    final bases = await StorageService.writableBaseDirs();
-    return StorageService.isUnderAnyBase(path, bases);
-  }
-
   // ---------------- 书源 ----------------
 
   /// 浏览器「书源」菜单的快捷入口（Z-Library 等）
@@ -1568,6 +1662,54 @@ class _SettingsPageState extends State<SettingsPage> {
           MaterialPageRoute<void>(builder: (_) => const BookSourcesPage()),
         ),
       ),
+    );
+  }
+
+  // ---------------- 项目 ----------------
+
+  /// 项目主页（GitHub）入口 —— **居中**放在设置页最底部（诊断日志提示的下方）
+  ///
+  /// 用户要求：位置在「诊断日志」那张卡**下面**，并且**居中**（不是整行卡片）。
+  /// 所以这里用 `Center` + `TextButton.icon`，并在按钮下面把网址小字显示出来 ——
+  /// 用户想手动复制也有得抄。
+  Widget _projectEntry() {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 32),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            TextButton.icon(
+              key: const ValueKey<String>('project-home'),
+              onPressed: _openProjectHome,
+              icon: const Icon(Icons.code, size: 18),
+              label: const Text('项目主页（GitHub）'),
+            ),
+            Text(
+              'github.com/Lzh1106/tts_reader',
+              style: theme.textTheme.labelSmall,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 打开项目主页
+  ///
+  /// ⚠️ 由 [HomePage] 注入的 [SettingsPage.onOpenUrl] 负责"切 Tab + 打开"。
+  /// 万一没有注入（例如单元测试直接 pump 本页），退一步把网址**显示出来**，
+  /// 让用户能自己复制 —— 不能点了没反应。
+  void _openProjectHome() {
+    const String url = SettingsPage.projectHomeUrl;
+    final void Function(String)? open = widget.onOpenUrl;
+    if (open != null) {
+      open(url);
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('项目主页：$url')),
     );
   }
 

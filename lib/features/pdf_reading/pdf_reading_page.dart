@@ -13,6 +13,7 @@ import '../../services/speech_diagnostics.dart';
 import '../../services/storage_service.dart';
 import '../../tts/tts_manager.dart';
 import '../../widgets/speech_diag_overlay.dart';
+import '../../widgets/toc_current_item.dart';
 import 'pdf_control_bar.dart';
 import 'pdf_page_layer.dart';
 import 'pdf_page_turn_controller.dart';
@@ -1984,19 +1985,37 @@ class PdfReadingPageState extends State<PdfReadingPage>
                           : entry.title;
                     }
                     final selected = pageIndex == currentPage;
-                    return ListTile(
-                      dense: true,
-                      selected: selected,
-                      leading: Text('${pageIndex + 1}'),
-                      title: Text(
-                        label,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+                    final ColorScheme tocScheme =
+                        Theme.of(sheetContext).colorScheme;
+                    // ★当前页标识（与文字档目录同一套装饰，见 TocCurrentItem）
+                    return TocCurrentItem(
+                      active: selected,
+                      child: ListTile(
+                        dense: true,
+                        leading: Text('${pageIndex + 1}'),
+                        title: Text(
+                          label,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: selected
+                              ? TextStyle(
+                                  color: tocScheme.primary,
+                                  fontWeight: FontWeight.w600,
+                                )
+                              : null,
+                        ),
+                        trailing: selected
+                            ? Icon(
+                                TocCurrentItem.currentIcon,
+                                size: 18,
+                                color: tocScheme.primary,
+                              )
+                            : null,
+                        onTap: () {
+                          Navigator.of(sheetContext).pop();
+                          unawaited(_jumpToAndRead(pageIndex));
+                        },
                       ),
-                      onTap: () {
-                        Navigator.of(sheetContext).pop();
-                        unawaited(_jumpToAndRead(pageIndex));
-                      },
                     );
                   },
                 ),

@@ -60,6 +60,38 @@ void main() {
           reason: '根目录不是文件最终待的地方 —— 文件会被挪进子文件夹');
     });
   });
+
+  // ── v1.21.44：选了自定义文件夹时，说明文案必须跟着落点变 ──────────────
+  group('自定义文件夹时的说明文案', () {
+    const String custom = '/storage/emulated/0/MyBooks';
+
+    test('★落点在自选目录 → 文案必须说自选目录，且不许再说"系统下载目录下的专属文件夹"', () {
+      final String hint = SettingsPage.downloadPathHint(inbox, customPath: custom);
+      expect(hint, contains(custom),
+          reason: '文件实际落在用户自选的目录，文案就得显示它');
+      expect(hint, isNot(contains(inbox)),
+          reason: '★选了自定义却还说"都放在 $inbox"= 骗用户（旧的固定文案就是这个毛病）');
+      expect(hint, isNot(contains('系统公共「下载」目录下的一个专属文件夹')));
+      // 方案 B 的两件事：① 现在用的是自定义位置 ② 不再走"下完再挪"
+      expect(hint, contains('当前使用自定义保存位置'));
+      expect(hint, contains('不再收纳到软件专属子文件夹'),
+          reason: '★必须说清自定义路径不再走"下完再挪进专属子文件夹"那一步');
+      expect(hint, isNot(contains('下完再挪')),
+          reason: '自定义路径不经过"下载根目录→子文件夹"这套流程');
+      // 这两条承诺在自定义路径下同样要成立
+      expect(hint, contains('卸载本应用不会删掉'));
+      expect(hint, contains('回退到应用私有目录'),
+          reason: '自定义目录可能失效（被删 / 不可写），必须提前告知会降级');
+      expect(hint, isNot(contains('云盘')),
+          reason: '★用户明确要求：文案里不许出现"云盘"字样');
+    });
+
+    test('没设自定义时保持原文案（回归）', () {
+      final String hint = SettingsPage.downloadPathHint(inbox);
+      expect(hint, contains(inbox));
+      expect(hint, isNot(contains('你自选的文件夹')));
+    });
+  });
 }
 
 /// [needle] 在 [text] 里出现了几次（重叠不算，够用）

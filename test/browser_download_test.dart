@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tts_reader/models/document.dart';
@@ -120,6 +122,120 @@ void main() {
       expect(storage.downloadTarget, DownloadTarget.publicDownloads);
     });
 
+    // ── v1.21.44：第三项 custom（自定义文件夹） ────────────────────────────
+    group('DownloadTarget.custom（自定义文件夹）', () {
+      test('加了 custom 之后 fromName 仍兼容旧数据，且兜底不变', () {
+        expect(DownloadTarget.fromName('appPrivate'), DownloadTarget.appPrivate);
+        expect(DownloadTarget.fromName('publicDownloads'),
+            DownloadTarget.publicDownloads);
+        // ★新增项必须认得出来，否则用户选完自定义、重启就被兜底吃成"系统下载目录"
+        expect(DownloadTarget.fromName('custom'), DownloadTarget.custom);
+        // ★兜底维持现状（publicDownloads）：改成 appPrivate 是行为变更，不是本任务
+        expect(DownloadTarget.fromName('nonsense'), DownloadTarget.publicDownloads);
+        expect(DownloadTarget.fromName(null), DownloadTarget.publicDownloads);
+        expect(DownloadTarget.fromName(42), DownloadTarget.publicDownloads);
+      });
+
+      test('custom 排在最后（老数据按 name 存，但 index 判据不能被挪位）', () {
+        expect(DownloadTarget.values.indexOf(DownloadTarget.custom),
+            DownloadTarget.values.length - 1);
+        expect(DownloadTarget.values.length, 3);
+      });
+
+      test('选了自定义文件夹 → 来源标记变成 custom，并能持久化', () async {
+        expect(storage.downloadTarget, DownloadTarget.publicDownloads);
+
+        await storage.setCustomDownloadPath('/storage/emulated/0/MyBooks');
+        expect(storage.customDownloadPath, '/storage/emulated/0/MyBooks');
+        expect(storage.downloadTarget, DownloadTarget.custom,
+            reason: '路径与来源标记必须一起变（设置页靠它显示"当前来源"）');
+        expect(storage.downloadPath, '/storage/emulated/0/MyBooks',
+            reason: '自定义路径优先于任何默认落点');
+
+        storage.resetForTest();
+        await storage.init();
+        expect(storage.customDownloadPath, '/storage/emulated/0/MyBooks');
+        expect(storage.downloadTarget, DownloadTarget.custom,
+            reason: '★重启后必须还是 custom（这条就是"选完就丢"的回归防线）');
+      });
+
+      test('恢复默认 → 路径清掉、来源标记回到 publicDownloads', () async {
+        await storage.setCustomDownloadPath('/storage/emulated/0/MyBooks');
+        await storage.resetDownloadPath();
+        expect(storage.customDownloadPath, isEmpty);
+        expect(storage.hasCustomDownloadPath, isFalse);
+        expect(storage.downloadTarget, DownloadTarget.publicDownloads,
+            reason: '不能留下"标记说自定义、路径却已清掉"的半态');
+        expect(storage.downloadPath, isNot('/storage/emulated/0/MyBooks'));
+      });
+
+      test('isFilesystemPath：只认以 / 开头的真实路径，拒掉 content:// 与空白', () {
+        expect(StorageService.isFilesystemPath('/storage/emulated/0/Books'), isTrue);
+        expect(StorageService.isFilesystemPath('  /sdcard/Books  '), isTrue);
+        // SAF 的"云盘 / 快捷方式"就是这种 URI —— flutter_downloader 写不进去
+        expect(
+            StorageService.isFilesystemPath(
+                'content://com.android.externalstorage.documents/tree/primary'),
+            isFalse);
+        expect(StorageService.isFilesystemPath(''), isFalse);
+        expect(StorageService.isFilesystemPath('/'), isFalse,
+            reason: '光一个根斜杠不是有效目录');
+        expect(StorageService.isFilesystemPath('relative/path'), isFalse);
+        // Windows 盘符也算文件系统路径（宿主机跑测试要用；Android 上见不到）
+        expect(StorageService.isFilesystemPath(r'C:\Temp\Books'), isTrue);
+      });
+
+      test('isWritableDir：临时目录能写；content:// 直接判否', () async {
+        final Directory tmp = Directory.systemTemp.createTempSync('tts_writable_');
+        addTearDown(() {
+          if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+        });
+        expect(await StorageService.isWritableDir(tmp.path), isTrue);
+        // 不存在的深层目录会被建出来（recursive）
+        final String deeper = '${tmp.path}/a/b/c';
+        expect(await StorageService.isWritableDir(deeper), isTrue);
+        expect(Directory(deeper).existsSync(), isTrue);
+        expect(await StorageService.isWritableDir('content://x/y'), isFalse);
+      });
+
+      test('isUsableCustomDir（放开后的唯一判据）：基准内直接过，外部路径真测', () async {
+        // ① 基准目录之内 → 通过（纯字符串比对，不碰磁盘）
+        final List<String> bases = await StorageService.writableBaseDirs();
+        if (bases.isNotEmpty) {
+          expect(await StorageService.isUsableCustomDir('${bases.first}/Books'), isTrue);
+        }
+        // ② 普通可写目录 → 通过（靠探针实测）
+        final Directory tmp = Directory.systemTemp.createTempSync('tts_usable_');
+        addTearDown(() {
+          if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+        });
+        expect(await StorageService.isUsableCustomDir(tmp.path), isTrue);
+        // ③ content://（系统文件选择器给出的 URI）→ 直接否，连探针都不试
+        expect(
+            await StorageService.isUsableCustomDir(
+                'content://com.android.externalstorage.documents/tree/primary'),
+            isFalse);
+        // ④ 父级是**文件**的路径 → 建不出来 → 否（真机上对应"目录被删/SD 卡拔出"）
+        final File blocker = File('${tmp.path}/blocker');
+        blocker.writeAsStringSync('x');
+        expect(await StorageService.isUsableCustomDir('${blocker.path}/sub'), isFalse);
+      });
+      test('hasAllFilesAccess：非 Android 恒为 true，测试开关能强制', () async {
+        // 测试环境（桌面/CI）不该误报"没有权限"，否则设置页流程根本走不到选择器
+        if (!Platform.isAndroid) {
+          expect(await StorageService.hasAllFilesAccess(), isTrue);
+        }
+        // 测试开关（只给测试用）：能强制成"已授权 / 未授权"
+        StorageService.debugAllFilesAccessOverride = false;
+        addTearDown(() => StorageService.debugAllFilesAccessOverride = null);
+        expect(await StorageService.hasAllFilesAccess(), isFalse);
+        StorageService.debugAllFilesAccessOverride = true;
+        expect(await StorageService.hasAllFilesAccess(), isTrue);
+        // 强制模式下 requestAllFilesAccess 只返回、不真跳系统页
+        await StorageService.requestAllFilesAccess();
+        expect(StorageService.debugAllFilesAccessOverride, isTrue);
+      });
+    });
     test('自定义下载路径：设置 / 读回 / 恢复默认', () async {
       expect(storage.hasCustomDownloadPath, isFalse);
       await storage.setCustomDownloadPath('/data/user/0/com.example.tts_reader/files/Books');

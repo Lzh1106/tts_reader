@@ -7,6 +7,16 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- 「所有文件访问」：允许用户把下载文件夹设到**任意**真实目录
+         （应用私有目录与系统「下载」目录之外的地方）。
+         ⚠️ Android 11+ 需要用户在系统设置里**手动**打开这个开关（不能弹窗申请），
+         界面上的入口在设置页 → 下载保存位置 → 选文件夹。
+         ⚠️ Android 10 及以下用不到它，靠上面的 READ/WRITE_EXTERNAL_STORAGE。
+         tools:ignore=ScopedStorage 是给 lint 的：本项目 publish_to: 'none'，
+         不走应用商店分发，所以这不是"违规"，而是刻意的产品选择。 -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
     <!-- Android 13+ 下载进度通知 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- flutter_downloader 前台服务 -->

@@ -7,33 +7,26 @@ build/
 .flutter-plugins
 .flutter-plugins-dependencies
 
-# 构建产物 / 内部归档（AKP 通过发布页分发，不进仓库）
-dist/
-release/
-snapshots/
-probe/
-test_assets/
-
-# 内部文档与日志
-HANDOFF.md
-FORBIDDEN.md
-*.log
-docs/内部*
+# 构建产物（APK 通过 dist/ 分发时按需保留）
+# dist/
 
 # Android
 android/.gradle/
 android/local.properties
 android/key.properties
+android/**/gradle-wrapper.jar
 android/app/debug/
 android/app/profile/
 android/app/release/
 *.jks
 *.keystore
 
-# IDE / 系统
+# IDE
 .idea/
 .vscode/
 *.iml
 *.iws
+
+# 系统
 .DS_Store
 Thumbs.db

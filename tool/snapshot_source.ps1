@@ -91,9 +91,7 @@ foreach ($item in Get-ChildItem $root -Force) {
 # 清单：记下「这份快照是什么」——回退时靠它确认
 $gitCommit = ''
 $gitExe = (Get-Command git -ErrorAction SilentlyContinue).Source
-if (-not $gitExe -and (Test-Path 'C:\ttsbuild\git\cmd\git.exe')) {
-  $gitExe = 'C:\ttsbuild\git\cmd\git.exe'
-}
+if (-not $gitExe -and (Test-Path 'C:\ttsbuild\git\cmd\git.exe')) { $gitExe = 'C:\ttsbuild\git\cmd\git.exe' }
 if (Test-Path $gitExe) {
   try {
     $gitCommit = (& $gitExe -C $root rev-parse --short HEAD 2>$null | Select-Object -First 1)

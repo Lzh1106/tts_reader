@@ -336,7 +336,7 @@ class _HomePageState extends State<HomePage> {
           BrowserPage(key: _browserKey)
         else
           const SizedBox.shrink(),
-        if (_visited.contains(2)) const SettingsPage() else const SizedBox.shrink(),
+        if (_visited.contains(2)) SettingsPage(onOpenUrl: _openInBrowser) else const SizedBox.shrink(),
       ],
     );
     // 浏览器的地址栏与前进/后退已经**渲染在 AppBar 里**（与标题同层），
@@ -450,6 +450,19 @@ class _HomePageState extends State<HomePage> {
       _visited.add(index);
     });
     if (index == 0) _load(); // 浏览器里导入的文档回到文档库时可见
+  }
+
+  /// 在**应用内浏览器**里打开一个网址（设置页「项目主页」等入口用）
+  ///
+  /// ⚠️ 顺序有讲究：IndexedStack 里的 BrowserPage 是**懒建**的
+  /// （`_visited` 控制），所以必须先 `_selectTab(1)` 把它建出来，
+  /// 否则 `_browserKey.currentState` 还是 null，`submitAddress` 会落空。
+  /// 又因为建出来要等这一帧结束，所以真正打开放在下一帧的回调里。
+  void _openInBrowser(String url) {
+    _selectTab(1);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _browserKey.currentState?.submitAddress(url);
+    });
   }
 
   // ---------------- 文档库 ----------------

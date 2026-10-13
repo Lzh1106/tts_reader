@@ -271,3 +271,21 @@ $os2 = Get-CimInstance Win32_OperatingSystem
 Write-Host "      回收后可用内存：$([math]::Round($os2.FreePhysicalMemory/1MB,1)) GB / $([math]::Round($os2.TotalVisibleMemorySize/1MB,1)) GB"
 
 Write-Host "`n完成。" -ForegroundColor Green
+
+# ───────────────────────────────────────────────────────────────────────────
+#  ★发布规矩（用户 2026-10-13 拍板）——**每次出正式版都要做，测试包不做**
+#
+#  1. 正式版：源码同步到 GitHub 仓库 <https://github.com/Lzh1106/tts_reader>，
+#     并把正式 APK 作为 GitHub Release 发布（tag 形如 v1.21.43）。
+#  2. 测试包（TESTxx）：**不上传仓库**，只在微信 / 桌面交付。
+#
+#  ⚠️ 本机 git-over-HTTPS 通道被卡（git push 十分钟无响应、ls-remote 超时），
+#     发布要走 **GitHub REST API 直写**（做法见交接文档 §2.7）：
+#     空仓库先 PUT /contents/README.md 落首个提交，再 blobs → trees → commits → refs。
+# ───────────────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "★ 别忘了同步发布（正式版才发，测试包不发）：" -ForegroundColor Cyan
+Write-Host "   1) 源码 → https://github.com/Lzh1106/tts_reader （走 GitHub API 直写，本机 git push 不通）" -ForegroundColor Cyan
+Write-Host "   2) 正式 APK → GitHub Release（tag v$Version，附件名用 ASCII：taohuayuan-reader-$Version.apk）" -ForegroundColor Cyan
+Write-Host "   3) 测试包（TESTxx）一律不上传" -ForegroundColor Cyan
+Write-Host "   细节与踩坑见 docs 交接文档 §2.7 / §2.8" -ForegroundColor Cyan

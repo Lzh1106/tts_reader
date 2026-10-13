@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/structured_document.dart';
+import '../widgets/toc_current_item.dart';
 
 /// 目录面板：原书自带目录（PDF 书签 / EPUB nav 与 NCX）+ 章节 / 页数跳转
 ///
@@ -242,21 +243,29 @@ class _TocSheetState extends State<TocSheet> {
         final active = entry.chapter == current;
         // 缩进按层级，最多 4 级，再深就都按 4 级对齐（省得标题被挤没）
         final indent = 16.0 + (entry.depth > 4 ? 4 : entry.depth) * 16.0;
-        return ListTile(
-          dense: true,
-          contentPadding: EdgeInsets.only(left: indent, right: 16),
-          title: Text(
-            entry.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: active ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w600) : null,
+        // ★当前章节标识（淡色圆角背景 + 加粗 + graphic_eq）：三处目录共用同一套装饰
+        return TocCurrentItem(
+          active: active,
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.only(left: indent, right: 16),
+            title: Text(
+              entry.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: active
+                  ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w600)
+                  : null,
+            ),
+            subtitle: Text(
+              document.chapterIsPage ? '第 ${entry.chapter + 1} 页' : '第 ${entry.chapter + 1} 章',
+              style: theme.textTheme.labelSmall,
+            ),
+            trailing: active
+                ? Icon(TocCurrentItem.currentIcon, size: 18, color: scheme.primary)
+                : null,
+            onTap: () => Navigator.pop(context, (entry.chapter, entry.paragraph)),
           ),
-          subtitle: Text(
-            document.chapterIsPage ? '第 ${entry.chapter + 1} 页' : '第 ${entry.chapter + 1} 章',
-            style: theme.textTheme.labelSmall,
-          ),
-          trailing: active ? Icon(Icons.play_arrow, size: 18, color: scheme.primary) : null,
-          onTap: () => Navigator.pop(context, (entry.chapter, entry.paragraph)),
         );
       },
     );
@@ -269,22 +278,34 @@ class _TocSheetState extends State<TocSheet> {
       itemBuilder: (context, index) {
         final chapter = document.chapters[index];
         final active = index == current;
-        return ListTile(
-          dense: true,
-          leading: CircleAvatar(
-            radius: 14,
-            backgroundColor: active ? scheme.primary : scheme.surfaceContainerHighest,
-            child: Text(
-              '${index + 1}',
-              style: theme.textTheme.labelSmall?.copyWith(
-                color: active ? scheme.onPrimary : scheme.onSurfaceVariant,
+        return TocCurrentItem(
+          active: active,
+          child: ListTile(
+            dense: true,
+            leading: CircleAvatar(
+              radius: 14,
+              backgroundColor: active ? scheme.primary : scheme.surfaceContainerHighest,
+              child: Text(
+                '${index + 1}',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: active ? scheme.onPrimary : scheme.onSurfaceVariant,
+                ),
               ),
             ),
+            title: Text(
+              active ? '${chapter.title}（当前）' : chapter.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: active
+                  ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w600)
+                  : null,
+            ),
+            subtitle: Text('${chapter.paragraphs.length} 段'),
+            trailing: active
+                ? Icon(TocCurrentItem.currentIcon, size: 18, color: scheme.primary)
+                : null,
+            onTap: () => Navigator.pop(context, (index, 0)),
           ),
-          title: Text(active ? '${chapter.title}（当前）' : chapter.title),
-          subtitle: Text('${chapter.paragraphs.length} 段'),
-          trailing: active ? Icon(Icons.play_arrow, size: 18, color: scheme.primary) : null,
-          onTap: () => Navigator.pop(context, (index, 0)),
         );
       },
     );
@@ -317,6 +338,16 @@ class _TocSheetState extends State<TocSheet> {
         return ExpansionTile(
           // 搜索时默认展开当前章，避免匹配结果还要再点一次
           initiallyExpanded: active,
+          // ★ 当前章节整行加淡色圆角背景（与上面两处同源，见 TocCurrentItem）
+          //
+          // ⚠️ 这里**不能**用 TocCurrentItem 包起来：ExpansionTile 的子项
+          // （那一章的页列表）会被一起染上背景色，看起来像"整个展开块都选中"。
+          // 用户明确要求"只高亮章节 header，展开后的子项页列表不一起高亮"，
+          // 所以走 backgroundColor / shape 这两个自带参数。
+          backgroundColor: TocCurrentItem.fillColor(context, active),
+          collapsedBackgroundColor: TocCurrentItem.fillColor(context, active),
+          shape: TocCurrentItem.expansionShape(active, 12),
+          collapsedShape: TocCurrentItem.expansionShape(active, 12),
           leading: CircleAvatar(
             radius: 14,
             backgroundColor: active ? scheme.primary : scheme.surfaceContainerHighest,
@@ -327,11 +358,30 @@ class _TocSheetState extends State<TocSheet> {
               ),
             ),
           ),
-          title: Text(
-            chapter.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: active ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w600) : null,
+          // ⚠️ 图标放在 title 的 Row 里而不是 trailing：trailing 一旦给了值，
+          // ExpansionTile 自带的展开箭头就没了。这里要**两者都有**。
+          title: Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  chapter.title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: active
+                      ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w600)
+                      : null,
+                ),
+              ),
+              if (active)
+                Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: Icon(
+                    TocCurrentItem.currentIcon,
+                    size: 18,
+                    color: scheme.primary,
+                  ),
+                ),
+            ],
           ),
           subtitle: Text('${chapter.paragraphs.length} 段 · $pageCount 页'),
           // 章节内容很多时，展开后一次性塞几百个 ListTile 会卡：这里只在展开时才建，
@@ -346,10 +396,9 @@ class _TocSheetState extends State<TocSheet> {
                   subtitle: Text(
                     '第 ${i * perPage + 1}-${(i * perPage + perPage) > chapter.paragraphs.length ? chapter.paragraphs.length : i * perPage + perPage} 段',
                   ),
-                  trailing: active &&
-                          document.pageOf(widget.cursor.$1, widget.cursor.$2, perPage) == i + 1
-                      ? Icon(Icons.play_arrow, size: 18, color: scheme.primary)
-                      : null,
+                  // ⚠️ 子项**不带任何"当前"标识**：用户要求只高亮章节 header。
+                  // （原来这里有个 play_arrow 标"当前页"，与"只标章节"冲突，
+                  //   而且它是另一个图标 —— 三处目录共用一个图标这条规矩不允许。）
                   onTap: () => Navigator.pop(context, (chapterIndex, i * perPage)),
                 )
             else

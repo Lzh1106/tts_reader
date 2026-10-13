@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/bookmark.dart';
@@ -32,9 +33,21 @@ import 'crash_log.dart';
 /// Android 的存储模型决定了只有这两种选择（第三方应用写不了任意路径）：
 /// - 应用私有目录：免权限、始终可读（自动导入文档库靠它）；
 /// - 系统下载目录：公共「下载」目录，文件管理器可见（Android 10+ 走 MediaStore）。
+///
+/// ⚠️ v1.21.44 起多了第三项 [custom]：**它只是"当前用的是自定义文件夹"这个来源标记**，
+/// 路径本身仍然存在 [StorageService.customDownloadPath] 里（唯一一份，不另开字段）。
 enum DownloadTarget {
   appPrivate('应用私有目录', '应用专属目录，免存储权限；卸载应用会一起清掉'),
-  publicDownloads('系统下载目录', '公共「下载」目录，文件管理器里能看到（需要 Android 10 及以上）');
+  publicDownloads('系统下载目录', '公共「下载」目录，文件管理器里能看到（需要 Android 10 及以上）'),
+  // ⚠️ **新增项必须放最后**：老数据是按 `name` 存的，但任何以 `index` 为判据的
+  // 地方（历史版本 / 外部脚本）都不能被这一项挪位。
+  custom(
+    '自定义文件夹',
+    '自选一个文件夹。\n'
+        '· 首次使用需在系统设置里开启「所有文件访问」权限；\n'
+        '· 授权后可选内部存储或 SD 卡上的任意文件夹；\n'
+        '· 若该文件夹日后被删除或不可写，下载会自动回退到应用私有目录并提示。',
+  );
 
   const DownloadTarget(this.label, this.description);
 
@@ -47,8 +60,15 @@ enum DownloadTarget {
   /// `null`（全新安装，从没选过）与坏数据都会落到 appPrivate，
   /// **默认值改了也等于没改**。这里显式：只有确实存过 `appPrivate` 才用它，
   /// 其余（null / 坏数据 / 未来新增值）一律回默认的 [publicDownloads]。
-  static DownloadTarget fromName(Object? name) =>
-      name == appPrivate.name ? appPrivate : publicDownloads;
+  ///
+  /// v1.21.44：[custom] 必须显式认出来 —— 否则用户选完自定义文件夹，
+  /// **重启后就被兜底吃成「系统下载目录」**（功能等于没做）。
+  /// ⚠️ 兜底本身**不动**（仍然是 publicDownloads）：改兜底是行为变更，与本次任务无关。
+  static DownloadTarget fromName(Object? name) {
+    if (name == appPrivate.name) return appPrivate;
+    if (name == custom.name) return custom;
+    return publicDownloads;
+  }
 }
 
 /// 一个搜索引擎：把查询串拼成搜索 URL
@@ -1003,12 +1023,25 @@ class StorageService {
   Future<void> setCustomDownloadPath(String path) async {
     _customDownloadPath = path.trim();
     await (await _sp).setString(_kDownloadCustomPath, _customDownloadPath);
+    // ★v1.21.44：选过自定义文件夹就把目标标成 [DownloadTarget.custom]，
+    // 让设置页能如实显示"当前来源"（路径仍只存上面那一份，不另开字段）。
+    if (_customDownloadPath.isNotEmpty &&
+        _downloadTarget != DownloadTarget.custom) {
+      await setDownloadTarget(DownloadTarget.custom);
+    }
   }
 
-  /// 🔄 恢复默认：清掉自定义路径（**不动** [downloadTarget]）
+  /// 🔄 恢复默认：清掉自定义路径，并把来源标记放回默认的 [DownloadTarget.publicDownloads]
+  ///
+  /// ⚠️ v1.21.44 起**会动 [downloadTarget]**（原来不动）。理由：来源标记与路径
+  /// 必须一起变，否则会留下"标记说自定义、路径却已经清掉"的半态；
+  /// 而"恢复默认"的落点本来就该是默认目标（公共「下载」+ 专属子文件夹）。
   Future<void> resetDownloadPath() async {
     _customDownloadPath = '';
     await (await _sp).remove(_kDownloadCustomPath);
+    if (_downloadTarget == DownloadTarget.custom) {
+      await setDownloadTarget(DownloadTarget.publicDownloads);
+    }
   }
 
   // ---------------- 「另存文件夹」（SAF，v1.21.41） ----------------
@@ -1068,6 +1101,117 @@ class StorageService {
       }
     }
     return bases;
+  }
+
+  /// 这个路径是不是**文件系统路径**（而不是 SAF 的 `content://` URI 等）
+  ///
+  /// ## 为什么需要它（v1.21.44：放开自定义文件夹的判据）
+  ///
+  /// 原来自定义路径的唯一判据是 [isUnderAnyBase]（必须是应用私有基准目录之内），
+  /// 而系统文件选择器**进不去**应用私有目录 —— 于是"自定义文件夹"实际上永远选不成
+  /// （设置页那段"只有部分机型可用"的弹窗就是当时留下的）。
+  ///
+  /// 现在放开到"以 `/` 开头的真实路径"：能不能写**由 [isWritableDir] 实测**决定，
+  /// 而不是靠猜。⚠️ 边界仍然明确：**只接受文件系统路径**，
+  /// `content://`（系统文件选择器给出的 URI）一律不接受 —— `flutter_downloader`
+  /// 只吃文件系统路径，强行支持要换整套存储方案（本轮不做）。
+  static bool isFilesystemPath(String path) {
+    final String p = path.trim();
+    if (p.length <= 1) return false;
+    if (p.startsWith('/')) return true; // Android / Linux / macOS 的绝对路径
+    // Windows 盘符（`C:\…` / `C:/…`）：本工程的单元测试跑在 Windows 宿主机上，
+    // 不认它就等于 [isWritableDir] 的正向路径**在宿主机上没法验**（只能验负向）。
+    // Android 上永远见不到这种形状，所以放宽这一条不影响真机行为。
+    return RegExp(r'^[A-Za-z]:[\\/]').hasMatch(p);
+  }
+
+  /// **实测**这个目录现在能不能写（外部路径唯一可靠的判据）
+  ///
+  /// 为什么不能靠猜：Android 10+ 的分区存储下，应用私有目录之外能不能写，
+  /// 取决于系统版本、目录归属（MediaStore 集合 / 厂商目录）、SD 卡挂载状态，
+  /// 没有一个静态判据能覆盖。所以直接**建目录 + 写一个 2 字节探针 + 删掉**。
+  ///
+  /// 返回 `false` 时调用方必须**降级并提示**（不能把文件丢进一个写不进去的目录）。
+  static Future<bool> isWritableDir(String path) async {
+    if (!isFilesystemPath(path)) return false;
+    try {
+      final Directory dir = Directory(path.trim());
+      if (!await dir.exists()) await dir.create(recursive: true);
+      final File probe = File(
+        '${dir.path}${Platform.pathSeparator}.taohuayuan-write-probe',
+      );
+      await probe.writeAsString('ok', flush: true);
+      if (await probe.exists()) await probe.delete();
+      return true;
+    } catch (_) {
+      // 权限被拒 / 只读挂载 / 目录被删 / SD 卡拔出 —— 都归"写不进去"
+      return false;
+    }
+  }
+
+  /// **这个路径能不能当自定义下载目录**（v1.21.44 放开后的唯一判据）
+  ///
+  /// 设置页「选文件夹」与浏览器页落盘**共用这一份**（不许各写一套，否则迟早漂移）：
+  ///
+  /// 1. 不是文件系统路径（`content://` 这类 URI）→ 否；
+  /// 2. 落在应用可写基准目录之内（[isUnderAnyBase]）→ **是**，纯字符串比对，不必探测；
+  /// 3. 其余（内部存储 / SD 卡上的任意文件夹）→ 用 [isWritableDir] **真写一个探针**实测：
+  ///    这类位置能不能写取决于系统版本与权限（Android 11+ 要 [hasAllFilesAccess]），
+  ///    只有实测才说得准。
+  static Future<bool> isUsableCustomDir(String path) async {
+    if (!isFilesystemPath(path)) return false;
+    final String p = path.trim();
+    if (isUnderAnyBase(p, await writableBaseDirs())) return true;
+    return isWritableDir(p);
+  }
+
+  /// 单元测试用的权限开关（**只给测试**：桌面/CI 上永远拿不到真实 Android 权限）
+  ///
+  /// `null` = 按真实平台判断；`true/false` = 强制当成已授权 / 未授权。
+  @visibleForTesting
+  static bool? debugAllFilesAccessOverride;
+
+  /// 是否拥有「所有文件访问权限」（Android 11+ 才有这个概念）
+  ///
+  /// * Android 11+（API 30+）：`Environment.isExternalStorageManager()` 的等价物，
+  ///   即 `Permission.manageExternalStorage.isGranted`；
+  /// * Android 10 及以下：**恒为 true** —— 那会儿靠 `WRITE_EXTERNAL_STORAGE`
+  ///   就能写公共存储，没有"所有文件访问"这个开关；
+  /// * 非 Android（桌面测试）：恒为 true，免得测试环境误报"没权限"。
+  ///
+  /// ⚠️ 这个权限**不能**用普通弹窗申请，必须跳系统设置页让用户手动开 ——
+  /// 所以"查询"（本方法）与"跳转"（[requestAllFilesAccess]）是两件事，
+  /// 调用方跳完回来必须**重新查一次**。
+  static Future<bool> hasAllFilesAccess() async {
+    final bool? forced = debugAllFilesAccessOverride;
+    if (forced != null) return forced;
+    if (!Platform.isAndroid) return true;
+    try {
+      return await Permission.manageExternalStorage.isGranted;
+    } catch (_) {
+      // 个别 ROM 的权限插件会抛异常：按"没授权"处理（用户还能用另外两个位置）
+      return false;
+    }
+  }
+
+  /// 跳到系统的「所有文件访问」授权页
+  ///
+  /// ⚠️ Android 11+ 的系统限制：这个权限没有"弹窗申请"这条路，
+  /// `permission_handler` 内部做的就是跳到
+  /// `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`。
+  /// 用户从设置页返回后，调用方**必须重新查** [hasAllFilesAccess]。
+  ///
+  /// 实测要点（国产 ROM 可能不同）：跳过去之后要能看见本应用的开关；
+  /// 若某个 ROM 上跳转不生效，退一步的方案是自己写 MethodChannel 发那个 Intent
+  /// （见交接文档「未闭环」）。
+  static Future<void> requestAllFilesAccess() async {
+    if (debugAllFilesAccessOverride != null) return; // 测试里不真跳
+    if (!Platform.isAndroid) return;
+    try {
+      await Permission.manageExternalStorage.request();
+    } catch (_) {
+      // 抛异常也算"没拿到"：调用方重新查一次即可
+    }
   }
 
   /// 这个路径是不是应用能直接写的私有目录（**纯字符串逻辑，便于单测**）

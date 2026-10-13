@@ -84,4 +84,141 @@ void main() {
           reason: '这些文本会把星号原样显示给用户：\n${offenders.join('\n---\n')}');
     });
   });
+
+  // ── v1.21.44：保存位置那一行要**跟随生效路径** ────────────────────────
+  group('保存位置跟随自定义路径', () {
+    Future<void> pump(WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1200, 20000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<TtsManager>.value(
+          value: TtsManager.instance,
+          child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+
+    testWidgets('默认（没设自定义）显示系统路径', (tester) async {
+      final String inbox = StorageService.instance.downloadInboxPath;
+      await pump(tester);
+      expect(find.textContaining(inbox), findsWidgets,
+          reason: '默认状态显示的应当是公共「下载」+ 专属子文件夹');
+      expect(find.textContaining('不再收纳到软件专属子文件夹'), findsNothing);
+    });
+
+    testWidgets('★已设自定义 → 进页面就显示自定义路径 + 方案 B 的说明文案',
+        (tester) async {
+      final storage = StorageService.instance;
+      // 先设好再进页面（真机上等价于"上次设过、这次重新进设置页"）
+      await storage.setCustomDownloadPath('/data/user/0/com.example.tts_reader/files/Books');
+      addTearDown(storage.resetDownloadPath);
+
+      await pump(tester);
+      expect(
+          find.textContaining('/data/user/0/com.example.tts_reader/files/Books'),
+          findsWidgets,
+          reason: '★自定义生效后，保存位置那一行必须显示自定义路径');
+      expect(find.textContaining(storage.downloadInboxPath), findsNothing,
+          reason: '★不能"显示自定义、下面还写着 inbox"');
+      expect(find.textContaining('不再收纳到软件专属子文件夹'), findsOneWidget,
+          reason: '★自定义生效时说明文案必须换成方案 B 那套');
+    });
+
+    testWidgets('★点「恢复默认」按钮：显示与说明文案都立刻刷回系统路径',
+        (tester) async {
+      final storage = StorageService.instance;
+      final String inbox = storage.downloadInboxPath;
+      await storage.setCustomDownloadPath('/data/user/0/com.example.tts_reader/files/Books');
+
+      await pump(tester);
+      expect(
+          find.textContaining('/data/user/0/com.example.tts_reader/files/Books'),
+          findsWidgets);
+
+      await tester.tap(find.byKey(const ValueKey<String>('download-path-reset')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(find.textContaining(inbox), findsWidgets,
+          reason: '★按钮路径也要刷新（_loadDownloadPath 的加载短路不能挡住这次刷新）');
+      expect(find.textContaining('不再收纳到软件专属子文件夹'), findsNothing);
+      expect(find.textContaining('下完再挪'), findsOneWidget,
+          reason: '回到默认后，"下完再挪进子文件夹"那套说明要回来');
+    });
+  });
+
+  // ── v1.21.44：设置页底部「项目主页（GitHub）」 ────────────────────────
+  group('项目主页入口', () {
+    testWidgets('★位置：在「诊断日志」下方，且水平居中', (tester) async {
+      tester.view.physicalSize = const Size(1200, 20000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<TtsManager>.value(
+          value: TtsManager.instance,
+          child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+
+      final Finder entry = find.byKey(const ValueKey<String>('project-home'));
+      expect(entry, findsOneWidget);
+
+      // ① 在「诊断日志」那张卡下方
+      final double cardBottom =
+          tester.getBottomLeft(find.text('诊断日志')).dy;
+      expect(tester.getTopLeft(entry).dy, greaterThan(cardBottom),
+          reason: '★用户要求：入口放在诊断日志提示的下方');
+
+      // ② 水平居中（与本页可用宽度的中心对齐，容差 1px）
+      final double centerX = tester.getCenter(entry).dx;
+      final double pageCenterX =
+          tester.getSize(find.byType(SettingsPage)).width / 2;
+      expect((centerX - pageCenterX).abs(), lessThanOrEqualTo(1.0),
+          reason: '★用户要求：这个按钮居中（实测 $centerX vs 中心 $pageCenterX）');
+    });
+
+    testWidgets('点一下会把 GitHub 地址交给外部打开入口', (tester) async {
+      String? opened;
+      tester.view.physicalSize = const Size(1200, 20000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<TtsManager>.value(
+          value: TtsManager.instance,
+          child: MaterialApp(
+            home: Scaffold(body: SettingsPage(onOpenUrl: (String url) => opened = url)),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(find.text('项目主页（GitHub）'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey<String>('project-home')));
+      await tester.pump();
+      expect(opened, SettingsPage.projectHomeUrl,
+          reason: '★按钮必须把项目主页地址交出去（由 HomePage 切到浏览器 Tab 打开）');
+      expect(opened, 'https://github.com/Lzh1106/tts_reader');
+    });
+
+    testWidgets('没有注入打开入口时：至少把地址显示出来（不能点了没反应）',
+        (tester) async {
+      tester.view.physicalSize = const Size(1200, 20000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<TtsManager>.value(
+          value: TtsManager.instance,
+          child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+
+      await tester.tap(find.byKey(const ValueKey<String>('project-home')));
+      await tester.pump();
+      expect(find.textContaining(SettingsPage.projectHomeUrl), findsWidgets);
+    });
+  });
 }

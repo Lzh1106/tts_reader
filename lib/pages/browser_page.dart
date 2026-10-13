@@ -1569,10 +1569,10 @@ class _BrowserPageState extends State<BrowserPage> {
     try {
       final storage = StorageService.instance;
       // ⚠️ 有自定义路径时**必须走私有目录那条路**（`saveInPublicStorage: false`）：
-      // 公共目录分支走 MediaStore，`savedDir` 会被忽略，自定义子路径根本不生效。
-      // 自定义路径本身也只在应用私有目录内才被接受（见 [_prepareSavedDir]）。
-      final useCustom = storage.customDownloadPath.isNotEmpty &&
-          await isWritableAppPrivatePath(storage.customDownloadPath);
+      // 公共目录分支走 MediaStore，`savedDir` 会被忽略，自定义路径根本不生效。
+      // ★v1.21.44：判据从"必须在应用私有目录内"放开成"是文件系统路径" ——
+      // 能不能写由 [_prepareSavedDir] 当场实测（写不进就降级并提示）。
+      final useCustom = StorageService.isFilesystemPath(storage.customDownloadPath);
       final toPublic = !useCustom &&
           storage.downloadTarget == DownloadTarget.publicDownloads;
       // Android 13+ 通知权限用于显示下载进度；写公共目录时还需要存储权限
@@ -1663,19 +1663,31 @@ class _BrowserPageState extends State<BrowserPage> {
 
   /// 准备保存目录
   ///
-  /// 优先级（v1.21.39 起）：
-  /// 1. **用户自定义路径**，但**只接受应用私有目录内的**（见
-  ///    [StorageService.writableBaseDirs] 的说明：公共目录里的自定义子路径
-  ///    `flutter_downloader` 写不进去）；
-  /// 2. 否则用 `<应用目录>/downloads/<文件夹名>`；
+  /// 优先级（v1.21.44 起）：
+  /// 1. **用户自定义文件夹** —— 只要它是**文件系统路径**（以 `/` 开头）就先用，
+  ///    并**当场实测能不能写**（[StorageService.isWritableDir]）：
+  ///    * 能写 → 就用它（这是"自选文件夹"真正生效的那条路）；
+  ///    * 写不进（Android 10+ 对应用私有目录之外的写入有系统限制 / SD 卡拔出 /
+  ///      权限被撤 / 目录被删）→ **降级到应用私有目录**并弹提示，
+  ///      绝不能把文件丢进一个写不进去的目录（插件会直接失败，用户只看到"下载失败"）。
+  ///
+  ///    ⚠️ v1.21.44 之前这里只接受"应用私有目录之内"的路径，而系统文件选择器
+  ///    进不去应用私有目录 —— 等于"自定义文件夹"永远选不成（设置页那段
+  ///    "只有部分机型可用"的弹窗就是当时留下的结论）。
+  ///
+  /// 2. 否则用 `<应用目录>/downloads/<文件夹名>`（应用私有，永远可写）；
   /// 3. 系统下载目录由插件的 MediaStore 流程决定（`savedDir` 会被忽略），
   ///    这里仍返回一个可写目录，避免插件在参数校验阶段就失败。
   Future<String> _prepareSavedDir(StorageService storage) async {
     final custom = storage.customDownloadPath;
-    if (custom.isNotEmpty && await isWritableAppPrivatePath(custom)) {
-      final dir = Directory(custom);
-      if (!await dir.exists()) await dir.create(recursive: true);
-      return dir.path;
+    if (StorageService.isFilesystemPath(custom)) {
+      final bool usable = await StorageService.isUsableCustomDir(custom);
+      if (usable) {
+        final dir = Directory(custom);
+        if (!await dir.exists()) await dir.create(recursive: true);
+        return dir.path;
+      }
+      _notifyCustomDirFallback(custom);
     }
     final dir = Directory(
       '${(await getApplicationDocumentsDirectory()).path}/downloads/${storage.downloadFolder}',
@@ -1684,14 +1696,16 @@ class _BrowserPageState extends State<BrowserPage> {
     return dir.path;
   }
 
-  /// 这个路径是不是应用能直接写的私有目录
-  ///
-  /// 判据与设置页**共用同一份**（[StorageService.isUnderAnyBase]），
-  /// 避免"设置页说能用、下载时却写不进去"这类漂移。
-  @visibleForTesting
-  static Future<bool> isWritableAppPrivatePath(String path) async {
-    final bases = await StorageService.writableBaseDirs();
-    return StorageService.isUnderAnyBase(path, bases);
+  /// 自定义文件夹用不了时的提示（降级一定伴随这句，不能让用户以为存到了自选目录）
+  void _notifyCustomDirFallback(String badPath) {
+    CrashLog.mark('下载[自定义降级] 自定义文件夹不可用 → 回退应用私有目录：$badPath');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 6),
+        content: Text('自定义文件夹不可用：$badPath\n已回退到应用私有目录，可在设置里重新选择'),
+      ),
+    );
   }
 
   /// 轮询任务状态直到完成 / 失败，返回落盘路径
