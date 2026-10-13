@@ -275,7 +275,7 @@ Write-Host "`n完成。" -ForegroundColor Green
 # ───────────────────────────────────────────────────────────────────────────
 #  ★发布规矩（用户 2026-10-13 拍板）——**每次出正式版都要做，测试包不做**
 #
-#  1. 正式版：源码同步到 GitHub 仓库 <https://github.com/Lzh1106/tts_reader>，
+#  1. 正式版：源码同步到 GitHub 仓库 <https://github.com/lzhtt23/tts_reader>，
 #     并把正式 APK 作为 GitHub Release 发布（tag 形如 v1.21.43）。
 #  2. 测试包（TESTxx）：**不上传仓库**，只在微信 / 桌面交付。
 #
@@ -285,7 +285,7 @@ Write-Host "`n完成。" -ForegroundColor Green
 # ───────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "★ 别忘了同步发布（正式版才发，测试包不发）：" -ForegroundColor Cyan
-Write-Host "   1) 源码 → https://github.com/Lzh1106/tts_reader （走 GitHub API 直写，本机 git push 不通）" -ForegroundColor Cyan
+Write-Host "   1) 源码 → https://github.com/lzhtt23/tts_reader （走 GitHub API 直写，本机 git push 不通）" -ForegroundColor Cyan
 Write-Host "   2) 正式 APK → GitHub Release（tag v$Version，附件名用 ASCII：taohuayuan-reader-$Version.apk）" -ForegroundColor Cyan
 Write-Host "   3) 测试包（TESTxx）一律不上传" -ForegroundColor Cyan
 Write-Host "   细节与踩坑见 docs 交接文档 §2.7 / §2.8" -ForegroundColor Cyan

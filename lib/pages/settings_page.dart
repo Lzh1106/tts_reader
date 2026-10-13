@@ -36,7 +36,15 @@ class SettingsPage extends StatefulWidget {
   final void Function(String url)? onOpenUrl;
 
   /// 项目在 GitHub 上的主页（设置页底部那个按钮的目标）
-  static const String projectHomeUrl = 'https://github.com/Lzh1106/tts_reader';
+  ///
+  /// ⚠️ 2026-10-14：GitHub 账号改名 `Lzh1106` → **`lzhtt23`**，地址跟着换。
+  /// 旧地址会 301 重定向，但界面里显示的应该是**现在**的地址。
+  static const String projectHomeUrl = 'https://github.com/lzhtt23/tts_reader';
+
+  /// 显示用的短地址（去掉 `https://`）——**由 [projectHomeUrl] 推导**，
+  /// 两处不会各写一份然后漂移。
+  static String get projectHomeShortUrl =>
+      projectHomeUrl.replaceFirst('https://', '');
 
   /// 外观设置里的关键控件（用例据此定位）
   static const Key dynamicColorKey = ValueKey<String>('settings-dynamic-color');
@@ -1687,7 +1695,7 @@ class _SettingsPageState extends State<SettingsPage> {
               label: const Text('项目主页（GitHub）'),
             ),
             Text(
-              'github.com/Lzh1106/tts_reader',
+              SettingsPage.projectHomeShortUrl,
               style: theme.textTheme.labelSmall,
             ),
           ],

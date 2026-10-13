@@ -200,7 +200,8 @@ void main() {
       await tester.pump();
       expect(opened, SettingsPage.projectHomeUrl,
           reason: '★按钮必须把项目主页地址交出去（由 HomePage 切到浏览器 Tab 打开）');
-      expect(opened, 'https://github.com/Lzh1106/tts_reader');
+      expect(opened, 'https://github.com/lzhtt23/tts_reader',
+          reason: '★账号改名后地址要跟着换（旧地址会 301，但显示/打开的都该是新地址）');
     });
 
     testWidgets('没有注入打开入口时：至少把地址显示出来（不能点了没反应）',
@@ -219,6 +220,25 @@ void main() {
       await tester.tap(find.byKey(const ValueKey<String>('project-home')));
       await tester.pump();
       expect(find.textContaining(SettingsPage.projectHomeUrl), findsWidgets);
+    });
+
+    testWidgets('★按钮下面那行短地址与按钮目标同源（不许各写一份）', (tester) async {
+      tester.view.physicalSize = const Size(1200, 20000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<TtsManager>.value(
+          value: TtsManager.instance,
+          child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(SettingsPage.projectHomeShortUrl, 'github.com/lzhtt23/tts_reader');
+      expect(find.text(SettingsPage.projectHomeShortUrl), findsOneWidget,
+          reason: '★界面上显示的那行必须由 projectHomeUrl 推导，避免改名后只改一半');
+      expect(SettingsPage.projectHomeUrl,
+          'https://${SettingsPage.projectHomeShortUrl}');
     });
   });
 }
