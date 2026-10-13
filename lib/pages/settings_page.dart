@@ -37,7 +37,7 @@ class SettingsPage extends StatefulWidget {
 
   /// 项目在 GitHub 上的主页（设置页底部那个按钮的目标）
   ///
-  /// ⚠️ 2026-10-14：GitHub 账号改名 `Lzh1106` → **`lzhtt23`**，地址跟着换。
+  /// ⚠️ 2026-10-14：主页地址换过一次（换了新的主页地址），这里跟着更新。
   /// 旧地址会 301 重定向，但界面里显示的应该是**现在**的地址。
   static const String projectHomeUrl = 'https://github.com/lzhtt23/tts_reader';
 
