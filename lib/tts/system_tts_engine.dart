@@ -1,0 +1,309 @@
+import 'dart:async';
+
+import 'package:flutter_tts/flutter_tts.dart';
+
+import 'tts_engine.dart';
+
+/// 系统 TTS 引擎（flutter_tts）
+///
+/// 额外实现 [LocalEngineHost]：设备上装了多个本地 TTS 引擎时可以枚举并切换。
+class SystemTtsEngine implements TtsEngine, LocalEngineHost {
+  SystemTtsEngine({String enginePackage = ''}) : _enginePackage = enginePackage.trim();
+
+  final FlutterTts _tts = FlutterTts();
+
+  /// 等待当前 speak 结束的凭据
+  Completer<void>? _pending;
+  void Function()? _onComplete;
+
+  bool _initialized = false;
+  bool _disposed = false;
+
+  /// 当前使用的本地引擎包名（空表示跟随系统默认）
+  String _enginePackage;
+
+  @override
+  String get id => 'system';
+
+  @override
+  String get displayName => _enginePackage.isEmpty
+      ? '系统 TTS'
+      : '本地 TTS · ${LocalTtsEngine.labelOf(_enginePackage)}';
+
+  @override
+  String? get enginePackage => _enginePackage.isEmpty ? null : _enginePackage;
+
+  /// 列出设备上安装的本地 TTS 引擎
+  ///
+  /// 桌面 / 测试环境没有原生实现，`getEngines` 会抛异常或返回空 —— 一律当「没有可选项」处理。
+  @override
+  Future<List<LocalTtsEngine>> listLocalEngines() async {
+    if (_disposed) return const <LocalTtsEngine>[];
+    try {
+      final raw = await _tts.getEngines;
+      final defaultEngine = await _tts.getDefaultEngine;
+      final packages = <String>[];
+      if (raw is List) {
+        for (final item in raw) {
+          final name = '$item'.trim();
+          if (name.isNotEmpty && name != 'null') packages.add(name);
+        }
+      } else if (raw is String && raw.trim().isNotEmpty) {
+        packages.add(raw.trim());
+      }
+      final defaultName = defaultEngine is String ? defaultEngine.trim() : '';
+      // 当前包名为空时，实际生效的是系统默认引擎
+      final current = _enginePackage.isEmpty ? defaultName : _enginePackage;
+      return <LocalTtsEngine>[
+        for (final package in packages)
+          LocalTtsEngine(
+            package: package,
+            label: LocalTtsEngine.labelOf(package),
+            isDefault: package == defaultName,
+            isCurrent: package == current,
+          ),
+      ];
+    } catch (_) {
+      return const <LocalTtsEngine>[];
+    }
+  }
+
+  /// 切换本地引擎：切换后必须重新走一遍 initialize（语言 / 语速 / 音色都要重设）
+  @override
+  Future<void> useLocalEngine(String package) async {
+    final target = package.trim();
+    if (target.isEmpty || target == _enginePackage) return;
+    try {
+      await _tts.stop();
+    } catch (_) {
+      // 停不掉也要继续切
+    }
+    await _tts.setEngine(target);
+    _enginePackage = target;
+    _initialized = false; // 让 _ensureReady 重新套用语言 / 语速 / 音色
+    await initialize();
+  }
+
+  @override
+  bool get isAvailable => !_disposed;
+
+  @override
+  Future<void> initialize() async {
+    if (_initialized || _disposed) return;
+    // 用户选过本地引擎就先切过去（切换要在 awaitSpeakCompletion 之前，
+    // 否则个别 ROM 上切引擎会把已注册的回调一起重置掉）
+    if (_enginePackage.isNotEmpty) {
+      try {
+        await _tts.setEngine(_enginePackage);
+      } catch (_) {
+        // 引擎被卸载 / 包名失效：退回系统默认，不影响朗读
+        _enginePackage = '';
+      }
+    }
+    // 让 speak() 的 Future 在整段朗读结束后才完成，朗读循环据此顺序推进
+    await _tts.awaitSpeakCompletion(true);
+    _tts.setCompletionHandler(_handleFinished);
+    _tts.setCancelHandler(_handleFinished);
+    _tts.setErrorHandler((dynamic message) {
+      // 出错也要唤醒等待中的 speak()，否则朗读循环会一直挂起
+      _completePending();
+      _onComplete?.call();
+    });
+    _initialized = true;
+  }
+
+  /// 完成 / 取消回调：唤醒等待者并通知上层。
+  ///
+  /// **时长判据（路径 B）**：本回调由引擎侧触发（完成 / 取消 / 出错都会走到这里）。
+  /// 若它距本次提交不到 [_minRealSpeakMs]，那它**不是**这一句读完 ——
+  /// 真机实测这种「假完成」只有 238 微秒（上一句的迟到回调，或引擎谎报），
+  /// 旧实现直接放行，于是主循环把没读的句子当成读完、位置被推飞。
+  /// 这里丢弃它、继续等真实回调；连续丢弃到 [_maxFakeCompleteDrops] 才放行（不卡死）。
+  ///
+  /// 打断路径不受影响：`pause()` / `stop()` 自己调 `_completePending()`（此时
+  /// `_pending` 已为 null），所以「被打断要尽快放行」的语义原样保留。
+  void _handleFinished() {
+    final DateTime? issuedAt = _speakIssuedAt;
+    if (issuedAt != null &&
+        _pending != null &&
+        _fakeCompleteDrops < _maxFakeCompleteDrops) {
+      final int elapsed = DateTime.now().difference(issuedAt).inMilliseconds;
+      if (elapsed < _minRealSpeakMs) {
+        _fakeCompleteDrops++;
+        return; // 假完成：不放行、也不通知上层，继续等
+      }
+    }
+    _completePending();
+    _onComplete?.call();
+  }
+
+  void _completePending() {
+    final pending = _pending;
+    _pending = null;
+    if (pending != null && !pending.isCompleted) pending.complete();
+  }
+
+  @override
+  Future<List<TtsVoice>> getVoices() async {
+    await initialize();
+    final raw = await _tts.getVoices;
+    if (raw is! List) return const <TtsVoice>[];
+    final voices = <TtsVoice>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final name = '${item['name'] ?? ''}'.trim();
+      if (name.isEmpty || name == 'null') continue;
+      voices.add(TtsVoice(id: name, name: name, locale: '${item['locale'] ?? ''}'.trim()));
+    }
+    return voices;
+  }
+
+  @override
+  Future<void> setVoice(String voiceId) async {
+    if (voiceId.isEmpty || _disposed) return;
+    await initialize();
+    for (final voice in await getVoices()) {
+      if (voice.id != voiceId) continue;
+      await _tts.setVoice(<String, String>{'name': voice.name, 'locale': voice.locale});
+      return;
+    }
+  }
+
+  @override
+  Future<void> setRate(double rate) async {
+    // 按需求把语速 ×0.5 交给 flutter_tts（其有效区间 0.0~1.0，1.0 最快）
+    await _tts.setSpeechRate(rate * 0.5);
+  }
+
+  @override
+  Future<void> setPitch(double pitch) => _tts.setPitch(pitch);
+
+  /// 等引擎完成回调的上限。
+  ///
+  /// 比 `TtsManager.speakTimeout`（30 秒）略长：让上层先给出**可见**的
+  /// 「朗读超时」失败，这里只兜「连上层都收不到」的极端情况。
+  static const Duration _completionTimeout = Duration(seconds: 35);
+
+  /// 提交被插件丢弃（返回 0）时的重投次数与间隔。
+  ///
+  /// 真机上「打断后紧接着的新一句」经常撞上这个丢弃（插件的 `speaking` 还没被
+  /// 框架的 onStop 清掉）；重投是**重新提交并听插件的回答**，不是读状态量。
+  static const int _submitAttempts = 8;
+  static const Duration _submitRetryDelay = Duration(milliseconds: 150);
+
+  /// 时长判据（路径 B）：完成回调距本次提交的合理下限。
+  ///
+  /// 一个汉字最短也要 ~80ms 才发得完；提交成功后几毫秒就回来的「完成」
+  /// 只可能是**上一句的迟到回调**或**引擎谎报**（真机实测 238 微秒）。
+  /// 口径与 PDF 侧 §4.106 的 `_minRealSpeakMs` 一致。
+  static const int _minRealSpeakMs = 100;
+
+  /// 连续丢弃假完成的次数上限：引擎若始终不回真实完成，也不能把主循环卡死。
+  static const int _maxFakeCompleteDrops = 3;
+
+  /// 本次 speak 的提交时刻（时长判据用；null = 当前没有在飞的 speak）
+  DateTime? _speakIssuedAt;
+
+  /// 本次 speak 已经丢弃掉几个「假完成」
+  int _fakeCompleteDrops = 0;
+
+  @override
+  Future<void> speak(String text) async {
+    if (_disposed || text.trim().isEmpty) return;
+    await initialize();
+
+    final done = Completer<void>();
+    _pending = done;
+    _fakeCompleteDrops = 0;
+    int attempts = 0;
+
+    // ① 提交：**不 await、也不把它的完成当成「读完」**。
+    //
+    // 为什么（真机实测根因，flutter_tts 4.0.2 android 侧）：
+    //   FlutterTtsPlugin.kt `speak` 分支：
+    //     if (speaking) { if (queueMode == QUEUE_FLUSH) { result.success(0); return } }
+    //   FlutterTtsPlugin.kt `stop` 分支：
+    //     if (speakResult != null) { speakResult!!.success(0); speakResult = null }
+    //   —— 即「上一句还没收尾」或「我们自己刚 stop 过」时，这个 Future 会
+    //   **立刻**以 0 返回（表示本次提交被丢弃），并不是读完。
+    //   旧实现 `Future.any([done.future, _tts.speak(text)])` 与它竞速，
+    //   于是把「提交即返回」当成「读完」→ 主循环疯狂推进
+    //   （真机诊断：R5 = 192、R4 = 195、R2 = 0，speak 全是 ms=0 ok=true）。
+    void submit() {
+      attempts++;
+      _speakIssuedAt = DateTime.now();
+      unawaited(
+        _tts.speak(text).then<void>(
+          (dynamic value) {
+            if (done.isCompleted) return; // 已经被 stop/pause 或完成回调放行
+            if (value == 0 || value == false) {
+              // 被丢弃：本次没有排上队，**不会有任何完成回调**。
+              // 等一小会儿重投；重投用尽才判失败 —— 绝不把它当「读完」。
+              if (attempts >= _submitAttempts) {
+                done.completeError(
+                  StateError('系统 TTS 未接收本次朗读（提交返回 $value，'
+                      '已重投 $attempts 次）'),
+                );
+                return;
+              }
+              Future<void>.delayed(_submitRetryDelay, submit);
+            }
+          },
+          onError: (Object error, StackTrace stack) {
+            if (!done.isCompleted) done.completeError(error, stack);
+          },
+        ),
+      );
+    }
+
+    submit();
+
+    // ② 完成信号**只有一个来源**：引擎的完成 / 取消 / 出错回调
+    //    （`_handleFinished` → `_completePending`）。
+    //    `pause()` / `stop()` 里的 `_completePending()` 也走同一条路 ——
+    //    被打断时按要求「尽快完成」，不在这里区分原因（那是 TtsManager 的事）。
+    try {
+      await done.future.timeout(_completionTimeout);
+    } on TimeoutException {
+      // 兜底：引擎始终没回完成回调。放开等待者后把超时抛给上层判失败，
+      // 不在这里把「超时」伪装成「读完」。
+      _completePending();
+      rethrow;
+    } finally {
+      if (identical(_pending, done)) _pending = null;
+      if (!done.isCompleted) done.complete();
+      _speakIssuedAt = null; // 这一拍结束了，时长判据不再适用
+    }
+  }
+
+  @override
+  Future<void> pause() async {
+    _completePending(); // 唤醒上层循环，游标保持在当前单元
+    try {
+      await _tts.pause();
+    } catch (_) {
+      // 个别平台不支持暂停，忽略
+    }
+  }
+
+  @override
+  Future<void> stop() async {
+    _completePending();
+    try {
+      await _tts.stop();
+    } catch (_) {
+      // 忽略停止异常
+    }
+  }
+
+  @override
+  void setCompletionHandler(void Function()? handler) => _onComplete = handler;
+
+  @override
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    _onComplete = null;
+    await stop();
+  }
+}

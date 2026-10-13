@@ -1,0 +1,194 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 云端 TTS 与内置浏览器 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 下载文件：Android 12 及以下需要读写外部存储 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!-- Android 13+ 下载进度通知 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- flutter_downloader 前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 后台朗读的媒体前台服务（Android 14+） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 后台朗读保活：申请加入电池优化白名单（设置页里有入口） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- 复制即朗读：悬浮朗读按钮（特殊权限，需用户在系统设置里授予） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 复制即朗读：开机后重新拉起悬浮球 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 复制即朗读的悬浮球以前台服务常驻（Android 14+ 需要声明类型） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Android 11+ 查询系统 TTS 引擎 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="桃花源阅读器"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
+        <!--
+          启动图标：只用一套编译进包里的图标（@mipmap/ic_launcher）。
+
+          历史说明：这里原来有一组 `activity-alias`，配合 Android 侧的
+          PackageManager 做「一键切换启动图标」。该功能**已按要求删除** ——
+          不同 ROM 上表现不一致（切了没反应、桌面图标缓存不刷新），
+          属于看着能用、实际不可靠的功能。
+
+          因此 MainActivity 恢复为唯一的启动入口（不再是 enabled=false + alias 兜底）。
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- 启动主题，Flutter 首帧后切换为 NormalTheme -->
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+
+            <!-- 桌面入口 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 分享即朗读：其它应用「分享 → 桃花源阅读器」 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!-- 划词朗读：文本选择菜单里的「朗读」 -->
+            <intent-filter android:label="朗读">
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!-- 打开文本朗读：用本应用打开 text/plain 文件 / 链接 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+        <!--
+          flutter_downloader：下载文件的 FileProvider。
+
+          注意（踩过的坑）：这里**不要**再去移除 androidx.startup 里的 WorkManagerInitializer。
+          插件 1.11.x 自己不带任何 provider 声明，如果按它文档里的「可选配置」关掉 WorkManager 的
+          默认初始化、又没有补上 vn.hunghd.flutterdownloader.FlutterDownloaderInitializer，
+          WorkManager 就永远不会被初始化 —— 表现是**每个下载都失败**，
+          Dart 侧只拿到一个 null taskId（错误信息就是「下载任务创建失败」），完全看不出原因。
+        -->
+        <provider
+            android:name="vn.hunghd.flutterdownloader.DownloadedFileProvider"
+            android:authorities="${applicationId}.flutter_downloader.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
+
+        <!-- audio_service：后台朗读的媒体前台服务 + 耳机/通知栏媒体按键 -->
+        <service
+            android:name="com.ryanheise.audioservice.AudioService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ==================== 复制即朗读（C2S） ==================== -->
+
+        <!-- 取剪贴板的透明界面：Android 10+ 只有有焦点的应用才读得到剪贴板 -->
+        <activity
+            android:name=".ClipboardSpeakActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/C2sTransparentTheme" />
+
+        <!-- 悬浮朗读按钮：前台服务 + 可拖动悬浮窗 -->
+        <service
+            android:name=".FloatingSpeakService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="复制即朗读的悬浮朗读按钮，需要常驻以显示系统悬浮窗" />
+        </service>
+
+        <!-- 快捷设置磁贴：朗读剪贴板 -->
+        <service
+            android:name=".C2sSpeakTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_speech"
+            android:label="朗读剪贴板"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- 快捷设置磁贴：开关悬浮朗读按钮 -->
+        <service
+            android:name=".C2sToggleTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_speech"
+            android:label="悬浮朗读"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+
+        <!-- 开机自启：用户开过「复制即朗读」时重新拉起悬浮球 -->
+        <receiver
+            android:name=".C2sBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

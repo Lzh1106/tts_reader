@@ -1,0 +1,17 @@
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_const_literals_to_create_immutables: true
+    avoid_print: false
+
+analyzer:
+  exclude:
+    # release/ 下是**历史版本的源码快照**（随发布包一起归档），不是当前工程的一部分。
+    # 不排除的话，改了当前 API 之后 analyze 会被旧快照里的引用报错淹没
+    # （例如 v1.16.0 快照里还在用已删除的 ReaderPage.pdfHighlightKey）。
+    - release/**
+    # snapshots/ 下同样是**归档**（历史版本源码 + 带探针的诊断态源码），
+    # 不是当前工程的一部分，理由同上。
+    - snapshots/**

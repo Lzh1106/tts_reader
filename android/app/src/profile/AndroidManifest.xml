@@ -1,0 +1,4 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Flutter 性能分析所需 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>
