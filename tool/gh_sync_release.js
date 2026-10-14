@@ -5,6 +5,17 @@
 //
 // 凭据：C:\Users\user\.dsh\dsh_wechat\logs\gh-token.txt（仅本机，不进仓库）
 //
+// ## ⚠️ 本机特有的坑：GitHub 流量被本地加速工具劫持，Node 默认不信任它的证书
+//
+// 本机跑着 `steamcommunity_302.cli`（GitHub 加速），它监听本机 443 并用**自签 CA**
+// 签发 GitHub 的证书。PowerShell 走 Windows 证书库所以能通，**Node 的 fetch 会失败**：
+//   `TypeError: fetch failed` → cause `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`
+//
+// 正确做法是**把那个根 CA 喂给 Node**（`NODE_EXTRA_CA_CERTS`），**不是**关掉证书校验。
+// 本脚本会**自动**做这件事：若 `build/local-ca.pem` 存在且环境变量还没设，
+// 就带上看环境变量**重新执行自己**（TLS 的信任锚只能在进程启动时确定，运行期改不了）。
+// CA 的导出见 `tool/export_local_ca.ps1`。
+//
 // 做法（Git Data API）：
 //   1) 取 main 当前 commit → 它的 tree（拿每个文件的 blob sha，作为"没变就不重传"的依据）
 //   2) 逐文件比对内容 sha：一样 → 复用原 blob；不一样 → POST /git/blobs 传新的
@@ -16,6 +27,18 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawnSync } = require('child_process');
+
+// ---- 证书信任锚：本机加速工具的 CA（见文件头说明）----
+const LOCAL_CA = path.join(__dirname, '..', 'build', 'local-ca.pem');
+if (!process.env.NODE_EXTRA_CA_CERTS && fs.existsSync(LOCAL_CA)) {
+  const r = spawnSync(
+    process.execPath,
+    [__filename, ...process.argv.slice(2)],
+    { stdio: 'inherit', env: { ...process.env, NODE_EXTRA_CA_CERTS: LOCAL_CA } }
+  );
+  process.exit(r.status === null ? 1 : r.status);
+}
 
 const OWNER = 'lzhtt23';
 const REPO = 'tts_reader';
