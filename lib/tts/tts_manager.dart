@@ -1535,6 +1535,17 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
     // 表现就是「点了没反应」（目录、章标题、播放键都会这样）。
     _rebindIfCleared();
     AutoSleepController.instance.notifyUserActivity(); // 用户主动发起的操作：空闲计时重来
+    // ★v1.21.49：**开始朗读 = 用户没有处于"主动暂停"状态**，清掉那个粘性标志。
+    //
+    // 为什么必须在这里清：`MediaInterruptionController._userPaused` 只有
+    // **通知栏 / 耳机的播放键**会清（`TtsAudioHandler.play` → `notifyUserResumed`）。
+    // 用户在**应用内**点播放走的是本方法，不经过那条路 —— 于是"很久以前按过一次
+    // 暂停"会一直留成 true，把**短打断 / 提示音自动接回**那条路也一起堵死
+    // （真机日志 2026-10-14 23:05 里 `userPaused=true` 而用户正在听，就是它）。
+    //
+    // `_restart` 是所有"开始朗读"路径的唯一漏斗（点句 / 快进 / 恢复 / 播放键），
+    // 放在这里一处即可覆盖全部。
+    MediaInterruptionController.instance.notifyUserResumed();
     // 开始朗读就申请音频焦点：别的应用出声时我们能被打断 / 被压低，
     // 来电能中断我们（受「允许其它媒体打断」开关控制）。
     unawaited(MediaInterruptionController.instance.requestFocus());

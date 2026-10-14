@@ -1,3 +1,4 @@
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tts_reader/services/storage_service.dart';
@@ -221,5 +222,41 @@ void main() {
     expect(MediaInterruptionController.instance.debugReleaseFocusCount,
         greaterThan(before),
         reason: '停止必须释放焦点');
+  });
+
+  // ★v1.21.52：播放恢复后必须清掉"已让位"标志（真机日志暴露的 bug）
+  //
+  // 日志原文（2026-10-15 00:25）：
+  // ```
+  // 00:25:39  视频 → 让位暂停（pausedForIt=true）
+  // 00:25:55  用户手动点播放恢复            ← 标志没被清
+  // 00:26:30  通知来了 → "已经让位暂停过了 → 不重复处理"（用的还是旧标志）
+  // ```
+  // 若用户恢复后**紧接着再放一个视频**，就会走"已经让位过 → 不重复处理"
+  // → **视频不再让位**。这里把"恢复播放就清标志"钉在 handler 这一层，
+  // 因为它是 TtsManager 与 PDF 会话**唯一**的公共出口。
+  test('★恢复播放（pushState playing=true）必须清掉"已让位"标志', () async {
+    final TtsAudioHandler handler = TtsAudioHandler(TtsManager.instance);
+    final _FakeSource source = _FakeSource()
+      ..playingValue = true
+      ..pausedValue = false;
+    handler.activate(source);
+
+    // 先制造一个"已让位"状态（模拟视频打断）
+    MediaInterruptionController.instance
+        .debugInterrupt(AudioInterruptionType.unknown);
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(MediaInterruptionController.instance.debugPausedForInterruption, isTrue,
+        reason: '前提：永久失去焦点 → 已让位');
+
+    // 用户恢复播放：来源报 playing=true，handler 推状态
+    handler.notifyFromSource();
+    await Future<void>.delayed(Duration.zero);
+    // ignore: avoid_print
+    print('DEVICE_VERIFY[handler-clear] '
+        'pausedForIt=${MediaInterruptionController.instance.debugPausedForInterruption}');
+    expect(MediaInterruptionController.instance.debugPausedForInterruption, isFalse,
+        reason: '★正在播就说明那次打断翻篇了 —— 标志必须清掉，'
+            '否则下一个视频不再让位');
   });
 }

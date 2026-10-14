@@ -26,13 +26,33 @@ class TtsAudioHandler extends BaseAudioHandler {
     // 系统打断（来电 / 别的播放器抢焦点）：暂停并记住，结束后自动继续
     MediaInterruptionController.instance.pauseForInterruption = () async {
       final source = _source;
-      if (!source.hasSession || !source.playing) return;
+      // ★诊断（v1.21.48）：记下"打断时到底在不在读"，否则事后无法区分
+      // 「本来就没在播（与打断无关）」与「在播、被我们停了」。
+      CrashLog.mark('打断暂停[进入] source=${source.sourceId} '
+          'hasSession=${source.hasSession} playing=${source.playing} '
+          'paused=${source.paused}');
+      if (!source.hasSession || !source.playing) {
+        CrashLog.mark('打断暂停[跳过] 没有会话或没在播 → 不暂停');
+        return;
+      }
       await source.pause();
+      CrashLog.mark('打断暂停[完成] playing=${source.playing} '
+          'paused=${source.paused}');
     };
     MediaInterruptionController.instance.resumeAfterInterruption = () async {
       final source = _source;
-      if (!source.hasSession) return;
+      CrashLog.mark('打断接回[进入] source=${source.sourceId} '
+          'hasSession=${source.hasSession} playing=${source.playing} '
+          'paused=${source.paused}');
+      if (!source.hasSession) {
+        CrashLog.mark('打断接回[跳过] 没有会话（!）');
+        return;
+      }
       source.playFromCursor();
+      // ★这一行是取证关键：调完接回之后**到底有没有真的在播**。
+      // `playing=false` = "接了但没接上" → 问题在引擎 / 会话，不在打断链。
+      CrashLog.mark('打断接回[完成] playing=${source.playing} '
+          'paused=${source.paused}（playing=false 就是没接上）');
     };
     // ★v1.21.45 改动 1：**长打断结束**只重推一次播放状态，不碰播放。
     //
@@ -204,6 +224,15 @@ class TtsAudioHandler extends BaseAudioHandler {
     final total = source.progressTotal;
     final index = source.progressIndex;
     final playing = source.playing;
+    // ★v1.21.52：**正在播就说明"那次打断已经翻篇了"**，清掉"已让位"标志。
+    //
+    // 为什么放在这里：`_pushState()` 是**所有来源**（TtsManager 与 PDF 会话）
+    // 唯一的公共出口 —— 应用内点播放、通知栏点播放、PDF 恢复，最终都会走到这。
+    // 只清 `TtsManager._restart` 那一处会漏掉 PDF 会话那条路。
+    //
+    // 不清的后果（真机日志 2026-10-15 00:25 实证）：用户看完视频手动恢复后，
+    // 标志留成 true → **下一个视频会被当成"已经让位过"而不再让位**。
+    if (playing) MediaInterruptionController.instance.notifyUserResumed();
     // v1.21.43 埋点：**非 idle 的推送**以前没有日志，导致真机手测 ② 只能猜
     // （「应用内恢复后通知栏图标没变」到底是我们没推、还是推了 ROM 没重绘）。
     // 这条每次推送只打一行，低频（每句一次），加进来能把责任分清楚。

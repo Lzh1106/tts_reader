@@ -30,28 +30,20 @@ class MediaInterruptionController {
   StreamSubscription<AudioInterruptionEvent>? _sub;
   bool _initialized = false;
 
-  /// 被系统打断前是否正在朗读（决定要不要自动继续）
-  bool _interruptedWhileSpeaking = false;
-
   /// 用户主动暂停过：这种情况下不自动继续
+  ///
+  /// ⚠️ **它必须能被"开始朗读"清掉**（v1.21.49 修）：这是个**粘性**标志，
+  /// 只有通知栏 / 耳机的播放键会清它（`notifyUserResumed`）。用户在**应用内**
+  /// 点播放走的是 `TtsManager._restart`，不经过那条路 —— 于是"很久以前按过一次
+  /// 暂停"会一直留成 true，把**短打断自动接回**那条路也一起堵死。
+  /// 真机日志（2026-10-14 23:05）里就是 `userPaused=true` 而用户正在听。
   bool _userPaused = false;
 
-  /// 打断类型：**瞬时让位**（系统提示音 dove duck）还是**长期让位**（视频 / 来电）
+  /// 本轮打断里我们**是否真的暂停过**
   ///
-  /// 见 [_onInterruption] 与 [_resumeAfterShortDuck] 的说明。
-  bool _shortDuck = false;
-
-  Timer? _duckResumeTimer;
-
-  /// 短打断「自动接回」的等待时长
-  ///
-  /// 判据：提示音一般 **几百毫秒**，而视频 / 音乐是**持续**的。
-  /// 所以被打断后先等这么久 —— 若对方已经结束，就自动接着读（用户感觉"没被打断"）；
-  /// 若对方还在出声（视频），就**保持暂停**并把状态如实推给通知栏。
-  ///
-  /// 设成 900ms 的理由：短于常见提示音（避免"刚停又读"听起来像卡顿），
-  /// 又明显短于用户能察觉"卡住了"的阈值。
-  static const Duration shortDuckResumeDelay = Duration(milliseconds: 900);
+  /// `false` = 那次打断是"瞬时"类型（微信通知）→ **朗读全程没停**，
+  /// 结束时什么都不用做。这是本设计要保住的"成功路径"。
+  bool _pausedForInterruption = false;
 
   /// 朗读真正开始 / 继续时调用：申请音频焦点（受开关控制）
   ///
@@ -103,7 +95,22 @@ class MediaInterruptionController {
   void notifyUserPaused() => _userPaused = true;
 
   /// 用户主动继续（按了播放键）
-  void notifyUserResumed() => _userPaused = false;
+  ///
+  /// ⚠️ **必须同时清掉"已让位"标志**（v1.21.52 真机日志暴露的 bug）：
+  /// 用户手动恢复播放后，那次打断就算**翻篇了**；若不清，标志会一直留成 true，
+  /// 于是**下一次打断**（哪怕是视频）会走进"已经让位过了 → 不重复处理"那一支，
+  /// **不再让位** —— 用户最在意的"视频必须让位"就失效了。
+  ///
+  /// 真机日志（2026-10-15 00:25）里的形态：
+  /// ```
+  /// 00:25:39  视频 → 让位暂停（pausedForIt=true）
+  /// 00:25:55  用户手动点播放恢复            ← 此处标志没被清
+  /// 00:26:30  通知来了 → "已经让位暂停过了 → 不重复处理"（用的是旧标志）
+  /// ```
+  void notifyUserResumed() {
+    _userPaused = false;
+    _pausedForInterruption = false;
+  }
 
   /// 开关变化后重新配置音频属性
   ///
@@ -195,8 +202,22 @@ class MediaInterruptionController {
   /// v1.21.38 曾把 `androidWillPauseWhenDucked` 改成 `false`（想让提示音完全不打断），
   /// 结果真机反馈「**被视频打断功能失效，通知栏图标也错了**」——
   /// 因为那个开关会**整个停掉 duck 事件上报**，而视频与提示音走的是同一条 duck 路径，
-  /// 于是该让位时也不让位了。现在改成：**照样让位，但短打断自动接回**，
-  /// 用「对方持续多久」来区分提示音与视频（一个布尔值区分不了）。
+  /// 于是该让位时也不让位了。
+  ///
+  /// ### v1.21.50（用户拍板方案一）：先别暂停，用宽限期区分
+  ///
+  /// v1.21.49 的"暂停 → 短的就接回"仍然让用户觉得**被打断**：接回时
+  /// **Android TTS 只能把这一句从头重发**（没有从半句续读的能力），
+  /// 用户原话是「老是打断重新开始读这句话太影响使用体验」。
+  /// 于是 v1.21.50 改成"先不暂停，2 秒内结束就当没发生"。
+  ///
+  /// ### v1.21.51（用户拍板方案三）：**改成按类型分流，去掉延迟**
+  ///
+  /// 宽限期虽然解决了"通知打断"，但**视频要等满 2 秒才让位**（用户实测反馈）。
+  /// 真机取证（2026-10-15 00:10）发现**类型本来就不同**：
+  /// 通知 = `pause`（1.1 秒后有结束事件），视频 = `unknown`（永远没有结束事件）。
+  /// 于是改成按类型即时分流，两类都立刻响应 —— 详见 [_pausedForInterruption] 上方
+  /// 那段说明与 `audio_session` 的源码依据。
   void _onInterruption(AudioInterruptionEvent event) {
     final handler = onInterruption;
     if (handler != null) {
@@ -204,73 +225,90 @@ class MediaInterruptionController {
       return;
     }
 
-    if (event.begin) {
-      // 先撤掉可能挂着的"自动接回"：对方还在（或又来了），不能接
-      _duckResumeTimer?.cancel();
-      _duckResumeTimer = null;
+    // ★诊断（v1.21.48）：打断这条链以前**一条日志都没有**，真机上
+    // "被通知打断后不读了"到底是"没收到事件"还是"收到了没接回"无从判断。
+    // 这几行是给真机取证用的，成本极低（一次字符串拼接）。
+    CrashLog.mark('音频打断[收到] type=${event.type.name} begin=${event.begin} '
+        'pausedForIt=$_pausedForInterruption userPaused=$_userPaused');
 
-      if (event.type == AudioInterruptionType.duck) {
-        // 瞬时让位：先暂停，再看对方是不是马上就走
-        _shortDuck = true;
-        _interruptedWhileSpeaking = true;
-        final pause = pauseForInterruption;
-        if (pause != null) unawaited(pause());
-        _duckResumeTimer = Timer(shortDuckResumeDelay, () {
-          _duckResumeTimer = null;
-          if (!_shortDuck || _userPaused) return;
-          _shortDuck = false;
-          _interruptedWhileSpeaking = false;
-          final resume = resumeAfterInterruption;
-          if (resume != null) unawaited(resume());
-        });
+    if (event.begin) {
+      // ⚠️ **同一类事件可能连着来**（通知响完接视频）：保持"已让位"这个事实，
+      // 不要因为新事件是"可以忽略的类型"就把之前的让位状态抹掉。
+      if (_pausedForInterruption) {
+        CrashLog.mark('音频打断[收到·开始] 已经让位暂停过了 → 不重复处理');
         return;
       }
 
-      // pause：视频 / 音乐 / 来电 —— 长期让位，保持暂停
-      _shortDuck = false;
-      _interruptedWhileSpeaking = true;
-      final pause = pauseForInterruption;
-      if (pause != null) unawaited(pause());
+      // ★★ v1.21.51 核心：**按类型分流，不再靠时长猜**（用户拍板的方案三）
+      //
+      // 真机取证（2026-10-15 00:10）拿到了决定性的类型差异：
+      //   微信通知 → `type=pause`，且 1.1 秒后有 `begin=false`
+      //   播放视频 → `type=unknown`，且**永远没有** `begin=false`
+      //
+      // 与 audio_session 0.1.25 的源码逐条对上（`lib/src/core.dart:254-283`）：
+      //   `lossTransient` / `lossTransientCanDuck` → `pause` / `duck`（瞬时，会结束）
+      //   `loss`（**永久**失去焦点）             → `unknown`（不会再有"结束"事件）
+      // 而 `unknown` 在 Android 上**只有 `loss` 这一个来源**（另两处在 iOS 分支）。
+      //
+      // 这也解释了"视频为什么没有结束事件"：原生在 `AUDIOFOCUS_LOSS` 时会
+      // `abandonAudioFocus()`（`AndroidAudioManager.java:307`）—— 我们不再持有焦点，
+      // 系统自然不会再通知我们"对方结束了"。
+      //
+      // 于是判据变成**确定性的**：
+      //   * `unknown`（永久失去）→ 立刻让位暂停；
+      //   * `pause` / `duck`（瞬时）→ **不暂停**（朗读继续，用户要的"不打断"）。
+      //
+      // 为什么瞬时的那类可以放心不暂停：通知只响一下，我们不停也就无所谓"让位"；
+      // 而真要长期占用焦点的场景（视频 / 来电）报的是 `loss` → 走上面那支。
+      final bool permanent = event.type == AudioInterruptionType.unknown;
+      if (permanent) {
+        CrashLog.mark('音频打断[开始·永久失去焦点] → 立刻让位暂停');
+        _pausedForItNow();
+        return;
+      }
+
+      CrashLog.mark('音频打断[开始·瞬时让位 type=${event.type.name}] '
+          '→ **不暂停**（朗读继续，不重读）');
       return;
     }
 
-    // 对方结束
-    //
-    // ★v1.21.45 改动 1（耳机键路由修复）：**先把"刚才是不是短打断"读出来再清零**。
-    //
-    // 为什么要读旧值：`_shortDuck` 原来是直接清零的，于是"结束"这一支无从区分
-    // 「系统提示音（几百毫秒，该自动接回）」与「视频 / 来电（长期，不该自动接回）」，
-    // 只能一律靠 `_interruptedWhileSpeaking`。现在按旧值分流：
-    //   * 旧值 true（短打断）→ 保持 v1.21.39 的自动接回，行为一字不改；
-    //   * 旧值 false（长打断）→ **不自动恢复朗读**，只重推一次播放状态
-    //     （让系统重新把我们标成活跃媒体 → 耳机键路由回来，见 [notifyAfterInterruptionEnded]）。
-    final bool wasShortDuck = _shortDuck;
-    _shortDuck = false;
-    final bool wasInterrupted = _interruptedWhileSpeaking;
-    _interruptedWhileSpeaking = false;
-    if (!wasInterrupted) return;
-
-    if (wasShortDuck) {
-      // 短打断：老行为（用户自己按过暂停就不接回）
-      if (_userPaused) return;
-      final resume = resumeAfterInterruption;
-      if (resume != null) unawaited(resume());
+    // 对方结束（只有"瞬时"那类才会走到这里；`loss` 那次不会再有结束事件）
+    final bool hadPaused = _pausedForInterruption;
+    _pausedForInterruption = false;
+    if (!hadPaused) {
+      CrashLog.mark('音频打断[结束] 之前没暂停过 → 什么都不用做（朗读全程未中断）');
       return;
     }
 
-    // 长打断：只重推状态，绝不碰播放（用户可能是自己暂停的，也可能是被打断的）
+    // 之前已让位：只重推状态，不自动接回（视频结束要不要续读是另一条线）
     final notify = notifyAfterInterruptionEnded;
+    CrashLog.mark('音频打断[结束] 之前已让位暂停，只重推状态、不接回朗读'
+        '（${notify == null ? "没有重推回调（!）" : "重推"}）');
     if (notify != null) unawaited(notify());
   }
 
-  /// 测试用：是否处于"短打断（提示音）"状态
-  @visibleForTesting
-  bool get debugShortDuck => _shortDuck;
+  /// 真正让位暂停（永久失去焦点：视频 / 来电）
+  void _pausedForItNow() {
+    _pausedForInterruption = true;
+    final pause = pauseForInterruption;
+    CrashLog.mark('音频打断[让位] → 暂停'
+        '（${pause == null ? "没有暂停回调（!）" : "调暂停"}）');
+    if (pause != null) unawaited(pause());
+  }
 
   /// 被打断时的回调（由 TtsAudioHandler 注册：暂停朗读）
+  ///
+  /// ⚠️ v1.21.50 起它**不再在打断一开始就调用** —— 只在"宽限期到点、对方仍在出声"
+  /// 时才调（见 [_onInterruption]）。也就是说：微信通知那种一两秒的打断
+  /// **永远不会走到这里**，朗读全程不中断。
   Future<void> Function()? pauseForInterruption;
 
   /// 打断结束时的回调（由 TtsAudioHandler 注册：继续朗读）
+  ///
+  /// ⚠️ v1.21.50 起**基本不再使用**：新设计下"短暂打断根本不暂停"，
+  /// 所以没有"接回"这回事；真的长打断（视频 / 来电）按既有设计也**不自动接回**
+  /// （只重推状态，见 [notifyAfterInterruptionEnded]）。
+  /// 保留它是为了不破坏既有接线与用例，将来若要"长打断结束自动接回"还能用。
   Future<void> Function()? resumeAfterInterruption;
 
   /// **长打断结束**时的回调：只重推播放状态，**不动播放**
@@ -304,18 +342,18 @@ class MediaInterruptionController {
   @visibleForTesting
   bool get debugUserPaused => _userPaused;
 
+  /// 测试用：本轮打断里我们是否真的让位暂停过
+  @visibleForTesting
+  bool get debugPausedForInterruption => _pausedForInterruption;
+
   @visibleForTesting
   void resetForTest() {
     _session = null;
     _sub?.cancel();
     _sub = null;
     _initialized = false;
-    _interruptedWhileSpeaking = false;
     _userPaused = false;
-    // 挂着的"短打断自动接回"也要撤掉，否则会跨用例把上一个用例的 resume 打出来
-    _duckResumeTimer?.cancel();
-    _duckResumeTimer = null;
-    _shortDuck = false;
+    _pausedForInterruption = false;
     pauseForInterruption = null;
     resumeAfterInterruption = null;
     notifyAfterInterruptionEnded = null;
