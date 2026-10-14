@@ -235,12 +235,32 @@ class MediaInterruptionController {
     }
 
     // 对方结束
+    //
+    // ★v1.21.45 改动 1（耳机键路由修复）：**先把"刚才是不是短打断"读出来再清零**。
+    //
+    // 为什么要读旧值：`_shortDuck` 原来是直接清零的，于是"结束"这一支无从区分
+    // 「系统提示音（几百毫秒，该自动接回）」与「视频 / 来电（长期，不该自动接回）」，
+    // 只能一律靠 `_interruptedWhileSpeaking`。现在按旧值分流：
+    //   * 旧值 true（短打断）→ 保持 v1.21.39 的自动接回，行为一字不改；
+    //   * 旧值 false（长打断）→ **不自动恢复朗读**，只重推一次播放状态
+    //     （让系统重新把我们标成活跃媒体 → 耳机键路由回来，见 [notifyAfterInterruptionEnded]）。
+    final bool wasShortDuck = _shortDuck;
     _shortDuck = false;
-    final wasInterrupted = _interruptedWhileSpeaking;
+    final bool wasInterrupted = _interruptedWhileSpeaking;
     _interruptedWhileSpeaking = false;
-    if (!wasInterrupted || _userPaused) return;
-    final resume = resumeAfterInterruption;
-    if (resume != null) unawaited(resume());
+    if (!wasInterrupted) return;
+
+    if (wasShortDuck) {
+      // 短打断：老行为（用户自己按过暂停就不接回）
+      if (_userPaused) return;
+      final resume = resumeAfterInterruption;
+      if (resume != null) unawaited(resume());
+      return;
+    }
+
+    // 长打断：只重推状态，绝不碰播放（用户可能是自己暂停的，也可能是被打断的）
+    final notify = notifyAfterInterruptionEnded;
+    if (notify != null) unawaited(notify());
   }
 
   /// 测试用：是否处于"短打断（提示音）"状态
@@ -252,6 +272,24 @@ class MediaInterruptionController {
 
   /// 打断结束时的回调（由 TtsAudioHandler 注册：继续朗读）
   Future<void> Function()? resumeAfterInterruption;
+
+  /// **长打断结束**时的回调：只重推播放状态，**不动播放**
+  ///
+  /// ## 治什么（v1.21.45 改动 1 · 耳机键路由）
+  ///
+  /// 真机现象：别的应用抢走音频焦点之后，**耳机键失效** ——
+  /// 而应用内按钮、通知栏按钮都还正常。怀疑系统在长打断期间把我们
+  /// 从"活跃媒体"里摘掉了，于是媒体键不再路由到我们。
+  ///
+  /// 长打断结束时重推一次 `playbackState`，让系统重新把我们标成活跃媒体。
+  /// **刻意不自动恢复朗读**：长打断（视频 / 来电）结束后要不要接着读，
+  /// 是另一条独立问题链（本轮明确暂缓）。
+  ///
+  /// ⚠️ 这是**第一轮尝试**，根因未定性。真机验收要点：
+  /// 1. 长打断结束后日志里应有 `媒体控制[pushState]`；
+  /// 2. 若日志有、耳机键仍无效 → 重推状态不足以改路由，下一步动焦点策略
+  ///    （暂停释放 / 播放申请 / `MediaSession.setActive(true)`），见交接文档。
+  Future<void> Function()? notifyAfterInterruptionEnded;
 
   /// 外部（测试）接管打断事件
   @visibleForTesting
@@ -280,6 +318,7 @@ class MediaInterruptionController {
     _shortDuck = false;
     pauseForInterruption = null;
     resumeAfterInterruption = null;
+    notifyAfterInterruptionEnded = null;
     onInterruption = null;
   }
 }

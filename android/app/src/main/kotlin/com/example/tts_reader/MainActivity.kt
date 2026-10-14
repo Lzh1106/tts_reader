@@ -44,6 +44,8 @@ class MainActivity : AudioServiceActivity() {
         KeepAlive.attach(this, flutterEngine.dartExecutor.binaryMessenger)
         // 「打开下载文件夹」通道（Android 没有标准 Intent，只能原生尽力而为）
         FolderChannel.attach(this, flutterEngine.dartExecutor.binaryMessenger)
+        // MP3 导出用的 LAME 编码通道（tts_reader/lame；库缺失时返回 false，Dart 侧回退 WAV）
+        LameChannel.attach(flutterEngine.dartExecutor.binaryMessenger)
         // 引擎此刻才可用：把本次启动 intent 的文本补推一次
         deliverPending()
     }

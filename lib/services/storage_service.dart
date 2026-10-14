@@ -14,6 +14,7 @@ import '../models/text_rule.dart';
 import '../models/web_link.dart';
 import 'book_source_directory.dart';
 import 'crash_log.dart';
+import 'lame_encoder.dart';
 
 /// 耳机（蓝牙 / 有线）按键的行为
 ///
@@ -132,6 +133,11 @@ class StorageService {
   static const String _kBackgroundImageOpacity = 'theme_bg_opacity';
   static const String _kAllowMediaInterrupt = 'audio_allow_media_interrupt';
 
+  /// 导出朗读音频的格式（★v1.21.45 改动 5）：`mp3`（默认）或 `wav`
+  ///
+  /// 存字符串而不是 bool，是为了以后加格式（比如 m4a）不用改数据类型。
+  static const String _kAudioExportFormat = 'audio_export_format';
+
   /// PDF 朗读句纵向位置档位（0.35 / 0.5 / 0.65）
   static const String _kPdfSentenceAlignment = 'pdf_sentence_alignment';
   static const String _kSpeechDiagEnabled = 'speech_diag_enabled';
@@ -234,6 +240,9 @@ class StorageService {
   /// 对方结束 / 来电挂断后自动继续。默认开 —— 这是用户要的行为。
   bool _allowMediaInterrupt = true;
 
+  /// 导出音频格式（存扩展名字符串；默认 mp3 —— 见 [audioExportFormat]）
+  String _audioExportFormat = 'mp3';
+
   /// 耳机「下一首」按键的行为
 
   bool get useDynamicColor => _useDynamicColor;
@@ -245,6 +254,23 @@ class StorageService {
   double get backgroundImageOpacity => _backgroundImageOpacity;
 
   bool get allowMediaInterrupt => _allowMediaInterrupt;
+
+  /// 导出朗读音频用的格式（★v1.21.45 改动 5）：默认 **MP3**
+  ///
+  /// 默认 MP3 的理由很实在：30 万字的书出 WAV 是几百 MB，出 MP3 只有几十 MB，
+  /// 而听书内容对码率不敏感。想留无损的可以在导出页选 WAV。
+  AudioExportFormat get audioExportFormat =>
+      AudioExportFormat.fromName(_audioExportFormat);
+
+  /// 记住用户选的导出格式（导出页选择后落盘，下次打开还是它）
+  ///
+  /// ⚠️ `StorageService` 不是 `ChangeNotifier`（它靠各处主动读），
+  /// 所以这里**不能** `notifyListeners()` —— 导出页自己 setState 就够了。
+  Future<void> setAudioExportFormat(AudioExportFormat value) async {
+    if (_audioExportFormat == value.extension) return;
+    _audioExportFormat = value.extension;
+    await (await _sp).setString(_kAudioExportFormat, _audioExportFormat);
+  }
 
 
   /// **PDF 朗读句在屏幕上的纵向位置**（v1.21.43 · 模型 A）
@@ -344,6 +370,7 @@ class StorageService {
     _backgroundImage = '';
     _backgroundImageOpacity = 0.35;
     _allowMediaInterrupt = true;
+    _audioExportFormat = 'mp3';
     _pdfSentenceAlignment = 0.35;
     _tutorialDone = false;
     speechDiagEnabled.value = false;
@@ -423,6 +450,7 @@ class StorageService {
     _backgroundImageOpacity = sp.getDouble(_kBackgroundImageOpacity) ?? 0.35;
     // 音频 / 耳机控制
     _allowMediaInterrupt = sp.getBool(_kAllowMediaInterrupt) ?? true;
+    _audioExportFormat = sp.getString(_kAudioExportFormat) ?? 'mp3';
     _pdfSentenceAlignment = sp.getDouble(_kPdfSentenceAlignment) ?? 0.35;
     await loadReaderStyle();
   }

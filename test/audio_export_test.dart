@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tts_reader/services/audio_export.dart';
+import 'package:tts_reader/services/lame_encoder.dart';
 import 'package:tts_reader/services/storage_service.dart';
 import 'package:tts_reader/services/text_processor.dart';
 import 'package:tts_reader/tts/system_tts_synthesizer.dart';
@@ -254,6 +255,177 @@ void main() {
         const Duration(seconds: 5),
       );
       expect(ok, isFalse);
+    });
+  });
+
+  // ── ★v1.21.45 改动 5：导出格式（MP3 / WAV） ─────────────────────────
+  group('导出格式与 MP3 转换', () {
+    test('★文件名后缀跟着格式走（默认 mp3）', () {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '第一句。第二句。')],
+        baseName: 'book',
+        extension: AudioExportFormat.mp3.extension,
+      );
+      expect(plan.parts.single.fileName, 'book-001.mp3');
+      // 合成时**永远先用 WAV**（系统 TTS 只能吐 WAV），文件名由它推出来
+      expect(plan.parts.single.wavFileName, 'book-001.wav');
+    });
+
+    test('选 WAV 时后缀是 .wav（保留无损这条路）', () {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '第一句。')],
+        baseName: 'book',
+        extension: AudioExportFormat.wav.extension,
+      );
+      expect(plan.parts.single.fileName, 'book-001.wav');
+      expect(plan.parts.single.wavFileName, 'book-001.wav');
+    });
+
+    test('★播放列表（m3u）里的后缀随格式变', () {
+      final chapters = <(String, String)>[('第一章', '第一句。第二句。')];
+      final mp3 = AudioExporter.plan(
+        chapters: chapters,
+        baseName: 'book',
+        extension: AudioExportFormat.mp3.extension,
+      );
+      final wav = AudioExporter.plan(
+        chapters: chapters,
+        baseName: 'book',
+        extension: AudioExportFormat.wav.extension,
+      );
+      expect(mp3.toPlaylist(), contains('book-001.mp3'));
+      expect(mp3.toPlaylist(), isNot(contains('.wav')));
+      expect(wav.toPlaylist(), contains('book-001.wav'));
+      expect(wav.toPlaylist(), isNot(contains('.mp3')));
+    });
+
+    test('★带点的 extension 也能吃（".mp3" 与 "mp3" 等价）', () {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '句子。')],
+        baseName: 'book',
+        extension: '.mp3',
+      );
+      expect(plan.parts.single.fileName, 'book-001.mp3');
+    });
+
+    test('★转换成功：产物记 MP3，且合成时用的是 WAV 名字', () async {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '句子。')],
+        baseName: 'book',
+        extension: AudioExportFormat.mp3.extension,
+      );
+      final synthNames = <String>[];
+      final convertCalls = <String>[];
+      final report = await AudioExporter.run(
+        plan,
+        synth: (text, fileName) async {
+          synthNames.add(fileName);
+          return true;
+        },
+        convert: (part) async {
+          convertCalls.add(part.fileName);
+          return true;
+        },
+      );
+      expect(synthNames, <String>['book-001.wav'],
+          reason: '★系统 TTS 只能吐 WAV —— 合成阶段必须用 .wav 名字');
+      expect(convertCalls, <String>['book-001.mp3']);
+      expect(report.files, <String>['book-001.mp3']);
+      expect(report.failed, isEmpty);
+    });
+
+    test('★转换失败：**回退到 WAV**（文件还在，不算失败）', () async {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '句子。')],
+        baseName: 'book',
+        extension: AudioExportFormat.mp3.extension,
+      );
+      final report = await AudioExporter.run(
+        plan,
+        synth: (text, fileName) async => true,
+        convert: (part) async => false, // 模拟 LAME 通道失败
+      );
+      expect(report.files, <String>['book-001.wav'],
+          reason: '★转不成 MP3 不能丢掉这次导出：用户手里得有一份能听的文件');
+      expect(report.failed, isEmpty, reason: '这不是"失败"，是降级');
+    });
+
+    test('★转换抛异常也按失败处理（照样留住 WAV）', () async {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '句子。')],
+        baseName: 'book',
+        extension: AudioExportFormat.mp3.extension,
+      );
+      final report = await AudioExporter.run(
+        plan,
+        synth: (text, fileName) async => true,
+        convert: (part) async => throw StateError('原生崩了'),
+      );
+      expect(report.files, <String>['book-001.wav']);
+      expect(report.failed, isEmpty);
+    });
+
+    test('不传 convert（选 WAV）时：合成与产物都是 .wav，不碰转换', () async {
+      final plan = AudioExporter.plan(
+        chapters: <(String, String)>[('第一章', '句子。')],
+        baseName: 'book',
+        extension: AudioExportFormat.wav.extension,
+      );
+      final synthNames = <String>[];
+      final report = await AudioExporter.run(
+        plan,
+        synth: (text, fileName) async {
+          synthNames.add(fileName);
+          return true;
+        },
+      );
+      expect(synthNames, <String>['book-001.wav']);
+      expect(report.files, <String>['book-001.wav']);
+    });
+
+    test('设置项：默认 mp3、能落盘读回、坏数据回默认', () async {
+      expect(StorageService.instance.audioExportFormat, AudioExportFormat.mp3,
+          reason: '★默认必须是 MP3（用户明确要求：默认 MP3、保留 WAV）');
+
+      await StorageService.instance.setAudioExportFormat(AudioExportFormat.wav);
+      StorageService.instance.resetForTest();
+      await StorageService.instance.init();
+      expect(StorageService.instance.audioExportFormat, AudioExportFormat.wav,
+          reason: '重启后要记住上次选的格式');
+
+      // 坏数据不许崩，回默认
+      expect(AudioExportFormat.fromName('flac'), AudioExportFormat.mp3);
+      expect(AudioExportFormat.fromName(null), AudioExportFormat.mp3);
+      expect(AudioExportFormat.fromName('wav'), AudioExportFormat.wav);
+    });
+
+    test('★LameEncoder：非 Android / 通道异常一律返回 false（不抛给用户）', () async {
+      // 测试环境（桌面）没有原生库 —— 必须"安静地失败"
+      final ok = await LameEncoder.encode(
+        wavPath: '/tmp/a.wav',
+        mp3Path: '/tmp/a.mp3',
+      );
+      expect(ok, isFalse);
+      expect(LameEncoder.lastError, isNotEmpty, reason: '要留下原因，便于诊断');
+
+      // 测试开关：直接给出结论，不碰平台通道
+      LameEncoder.debugEncodeOverride = true;
+      addTearDown(() => LameEncoder.debugEncodeOverride = null);
+      expect(
+        await LameEncoder.encode(wavPath: '/tmp/a.wav', mp3Path: '/tmp/a.mp3'),
+        isTrue,
+      );
+    });
+
+    test('★LameEncoder：拿不到音乐目录时明确回退（不尝试转换）', () async {
+      LameEncoder.debugMusicDirOverride = '';
+      addTearDown(() => LameEncoder.debugMusicDirOverride = null);
+      final ok = await LameEncoder.convertInMusicDir(
+        wavFileName: 'book-001.wav',
+        mp3FileName: 'book-001.mp3',
+      );
+      expect(ok, isFalse);
+      expect(LameEncoder.lastError, contains('音乐目录'));
     });
   });
 }

@@ -1698,6 +1698,17 @@ class _SettingsPageState extends State<SettingsPage> {
               SettingsPage.projectHomeShortUrl,
               style: theme.textTheme.labelSmall,
             ),
+            // ★v1.21.45：开源许可入口（LAME 是 LGPL-2.0，应用内要有声明处）
+            TextButton.icon(
+              key: const ValueKey<String>('open-source-licenses'),
+              onPressed: () => showLicensePage(
+                context: context,
+                applicationName: '桃花源阅读器',
+                applicationVersion: '1.21.45',
+              ),
+              icon: const Icon(Icons.article_outlined, size: 18),
+              label: const Text('开源许可'),
+            ),
           ],
         ),
       ),

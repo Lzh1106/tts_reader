@@ -6,6 +6,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:pdfrx/pdfrx.dart';
 
+import '../../services/crash_log.dart';
 import 'pdf_text_layer.dart';
 
 /// 一页 PDF 的渲染 + 透明文本层。
@@ -447,6 +448,104 @@ class PdfTextLayerPainter extends CustomPainter {
       oldDelegate.selecting != selecting;
 }
 
+/// 一页文字层的**几何体检**结果（★v1.21.45 改动 2/3）
+///
+/// 两个用途：
+/// 1. **诊断探针**：把「字符盒 / 行 / 句 / 页面尺寸」打成一行日志（[logLine]），
+///    以后判断"这页到底抽出了什么"不用再靠猜；
+/// 2. **异常判据**：字符盒大面积落到页面之外 → 这份 PDF 的文字位置本身有问题，
+///    高亮必然对不齐（[anomalous]），界面据此提示一次。
+class PdfTextLayerGeometry {
+  const PdfTextLayerGeometry({
+    required this.pageNumber,
+    required this.charBoxes,
+    required this.lines,
+    required this.sentences,
+    required this.pageSize,
+    required this.outsideBoxes,
+    required this.tolerance,
+    required this.anomalyRatio,
+  });
+
+  final int pageNumber;
+
+  /// 有效字符盒数（**排除零面积占位盒**：那些是 fragment 之间被引擎丢掉的字符）
+  final int charBoxes;
+  final int lines;
+  final int sentences;
+  final Size pageSize;
+
+  /// 落在「页面 + 容忍带」之外的字符盒数
+  final int outsideBoxes;
+
+  /// 容忍带：页面尺寸外扩这么多比例仍算"在页面内"（默认 5%）
+  final double tolerance;
+
+  /// 越界比例超过这个值就判异常（默认 20%）
+  final double anomalyRatio;
+
+  /// 越界比例（0~1）。没有有效字符盒时算 0（无从判断，不误报）
+  double get outsideRatio => charBoxes == 0 ? 0 : outsideBoxes / charBoxes;
+
+  /// 是不是「文字位置异常」的 PDF
+  bool get anomalous => charBoxes > 0 && outsideRatio > anomalyRatio;
+
+  /// 诊断探针那一行（**纯字符串**，格式由单测钉住）
+  String get logLine =>
+      'PDF 文字层[第 $pageNumber 页] 字符盒=$charBoxes 行=$lines 句=$sentences '
+      '页面=${pageSize.width.toStringAsFixed(0)}x${pageSize.height.toStringAsFixed(0)}';
+
+  /// 异常时的诊断说明（含越界比例与阈值，便于拿日志判案）
+  String get anomalyNote =>
+      'PDF 文字层[第 $pageNumber 页] 几何异常：$outsideBoxes/$charBoxes 个字符盒在页面外'
+      '（${(outsideRatio * 100).toStringAsFixed(1)}% > ${(anomalyRatio * 100).toStringAsFixed(0)}%，'
+      '容忍带 ${(tolerance * 100).toStringAsFixed(0)}%）';
+}
+
+/// 给一页的字符盒做几何体检（**纯函数**，可单测）
+///
+/// ## 判据（与施工单一致）
+///
+/// 1. **零面积盒直接不算**：`loadTextLayer` 会给"没有字符盒的位置"填 `Rect.zero`
+///    （fragment 之间被引擎丢掉的字符），它们不是真的错位；
+/// 2. 页面外扩 [tolerance]（默认 5%）算**容忍带** —— 版心外的页码、页眉页脚、
+///    轻微溢出的最后一个字都在这里，属正常；
+/// 3. 用**字符盒中心**判定在不在页面内：某些 PDF 的最后一个字符盒会略微溢出，
+///    而"整块版面错位"会让大量盒子的中心都跑到页面外；
+/// 4. 越界比例 **> 20%** 才判异常（施工单给的门槛）。
+PdfTextLayerGeometry analyzeTextLayerGeometry({
+  required int pageNumber,
+  required List<Rect> charRects,
+  required Size pageSize,
+  required int lines,
+  required int sentences,
+  double tolerance = 0.05,
+  double anomalyRatio = 0.20,
+}) {
+  final double padX = pageSize.width * tolerance;
+  final double padY = pageSize.height * tolerance;
+  final Rect allowed = Rect.fromLTRB(-padX, -padY, pageSize.width + padX, pageSize.height + padY);
+
+  var boxes = 0;
+  var outside = 0;
+  for (final r in charRects) {
+    if (r.width <= 0 || r.height <= 0) continue; // 零面积占位盒
+    boxes++;
+    if (!allowed.contains(r.center)) outside++;
+  }
+
+  return PdfTextLayerGeometry(
+    pageNumber: pageNumber,
+    charBoxes: boxes,
+    lines: lines,
+    sentences: sentences,
+    pageSize: pageSize,
+    outsideBoxes: outside,
+    tolerance: tolerance,
+    anomalyRatio: anomalyRatio,
+  );
+}
+
 /// 从 `pdfrx` 的 `PdfPageText` 构建本页文本层
 ///
 /// ⚠️ **坐标翻转**：pdfrx 1.x 的 `PdfRect` 用的是 **PDF 原生坐标系**
@@ -455,7 +554,17 @@ class PdfTextLayerPainter extends CustomPainter {
 /// `flutterTop = pageHeight - pdfTop`。
 /// 不翻的后果是高亮框**上下颠倒**（字的纵向位置整体镜像），
 /// 而且点上面的字会命中下面的字 —— 排查起来很费劲，所以在源头就翻好。
-Future<PdfPageTextLayer?> loadTextLayer(PdfPage page) async {
+///
+/// ## ★v1.21.45：抽完必做一次几何体检
+///
+/// * **永远**打一行诊断探针（[PdfTextLayerGeometry.logLine]）；
+/// * 判为异常时再打一条说明，并通过 [onGeometry] 交给调用方 ——
+///   弹不弹提示由**界面**决定（`loadTextLayer` 没有 SnackBar 上下文），
+///   而且要按文档只弹一次（见 `PdfReadingPage` 的 `_geometryWarnedDocs`）。
+Future<PdfPageTextLayer?> loadTextLayer(
+  PdfPage page, {
+  void Function(PdfTextLayerGeometry geometry)? onGeometry,
+}) async {
   final pageText = await page.loadText();
   final fullText = pageText.fullText;
   if (fullText.trim().isEmpty) return null;
@@ -485,13 +594,29 @@ Future<PdfPageTextLayer?> loadTextLayer(PdfPage page) async {
     }
   }
 
-  return buildTextLayer(
+  final layer = buildTextLayer(
     pageNumber: page.pageNumber,
     pageSize: page.size,
     fullText: fullText,
     charRects: rects,
     segment: segmentIntoSentences,
   );
+
+  // ★改动 2 / 3：几何体检（探针永远打；异常交给界面去提示）
+  final geometry = analyzeTextLayerGeometry(
+    pageNumber: page.pageNumber,
+    charRects: rects,
+    pageSize: page.size,
+    lines: layer.lines.length,
+    sentences: layer.sentences.length,
+  );
+  CrashLog.mark(geometry.logLine);
+  if (geometry.anomalous) {
+    CrashLog.mark(geometry.anomalyNote);
+    onGeometry?.call(geometry);
+  }
+
+  return layer;
 }
 
 /// 把一个 `ui.Image` 转成可绘制的画布内容（导出 / 缩略图会用）

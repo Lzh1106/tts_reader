@@ -1,7 +1,15 @@
 import 'dart:async';
 
+import 'lame_encoder.dart';
+
 /// 把一段文本合成到音频文件的函数（真实实现走系统 TTS，测试注入假实现）
 typedef SynthToFile = Future<bool> Function(String text, String fileName);
+
+/// 把刚合成出来的 WAV 转成目标格式（★v1.21.45 改动 5）
+///
+/// 返回 `true` = 目标格式（MP3）已就位；`false` = 没转成，**WAV 就是产物**
+/// （实现见 [LameEncoder.convertInMusicDir]）。
+typedef ConvertToFormat = Future<bool> Function(AudioPart part);
 
 /// 一个待合成的片段（= 一个音频文件）
 class AudioPart {
@@ -26,6 +34,17 @@ class AudioPart {
   final int chapterIndex;
 
   final String chapterTitle;
+
+  /// 合成时用的 WAV 文件名（★v1.21.45 改动 5）
+  ///
+  /// 系统 TTS **只能吐 WAV**：所以哪怕最终要给用户 MP3，第一步也必须先合成
+  /// 一个 WAV 出来（名字就是本 getter），再用 LAME 转成 [fileName]。
+  /// 两种格式下都用得到它 —— 出 WAV 时它就是最终名字。
+  String get wavFileName {
+    final int dot = fileName.lastIndexOf('.');
+    final String stem = dot <= 0 ? fileName : fileName.substring(0, dot);
+    return '$stem.wav';
+  }
 
   @override
   String toString() => 'AudioPart($index, $fileName, ${text.length} 字)';
@@ -186,6 +205,7 @@ class AudioExporter {
     required SynthToFile synth,
     void Function(AudioExportProgress progress)? onProgress,
     bool Function()? isCancelled,
+    ConvertToFormat? convert,
   }) async {
     final files = <String>[];
     final failed = <String>[];
@@ -196,13 +216,23 @@ class AudioExporter {
       if (isCancelled?.call() ?? false) {
         return AudioExportReport(files: files, failed: failed, cancelled: true);
       }
+      // ① 系统 TTS 合成：**永远先出 WAV**（引擎只能吐 WAV）
       var ok = false;
       try {
-        ok = await synth(part.text, part.fileName);
+        ok = await synth(part.text, convert == null ? part.fileName : part.wavFileName);
       } catch (_) {
         ok = false;
       }
-      if (ok) {
+      // ② 需要 MP3 时再用 LAME 转；转失败就**把 WAV 当产物**（文件还在，用户有得听）
+      if (ok && convert != null) {
+        var converted = false;
+        try {
+          converted = await convert(part);
+        } catch (_) {
+          converted = false;
+        }
+        files.add(converted ? part.fileName : part.wavFileName);
+      } else if (ok) {
         files.add(part.fileName);
       } else {
         failed.add(part.fileName);

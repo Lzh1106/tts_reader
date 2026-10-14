@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../models/structured_document.dart';
 import '../services/audio_export.dart';
+import '../services/lame_encoder.dart';
+import '../services/storage_service.dart';
 import '../services/text_processor.dart';
 import '../tts/system_tts_synthesizer.dart';
 import '../tts/tts_manager.dart';
@@ -47,6 +49,15 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
   SystemTtsSynthesizer? _synth;
   bool _running = false;
 
+  /// 导出格式（★v1.21.45 改动 5）：初值取设置里记住的那个，默认 MP3
+  late AudioExportFormat _format = StorageService.instance.audioExportFormat;
+
+  /// 这次导出里有几个片段**没能转成 MP3**（按 WAV 出的）
+  ///
+  /// 用来在结果卡里如实告诉用户："有几个文件是 WAV" —— 而不是只报成功数，
+  /// 让用户去文件管理器里自己发现格式不对。
+  int _fellBackToWav = 0;
+
   @override
   void initState() {
     super.initState();
@@ -74,7 +85,22 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
           TextProcessor.instance.apply(widget.chapters[index].text),
         ),
     ];
-    _plan = AudioExporter.plan(chapters: chapters, baseName: widget.title);
+    _plan = AudioExporter.plan(
+      chapters: chapters,
+      baseName: widget.title,
+      // ★v1.21.45 改动 5：文件名后缀跟着**当前选的格式**走（book-001.mp3 / .wav）
+      extension: _format.extension,
+    );
+  }
+
+  /// 换格式：重建计划（文件名要跟着变）+ 落盘记住这次的选择
+  void _setFormat(AudioExportFormat value) {
+    if (_format == value) return;
+    setState(() {
+      _format = value;
+      _rebuildPlan();
+    });
+    unawaited(StorageService.instance.setAudioExportFormat(value));
   }
 
   /// 估算朗读时长：按每秒约 5 个字（正常语速）粗算，只用于给用户一个量级
@@ -131,6 +157,7 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
     setState(() {
       _running = true;
       _report = null;
+      _fellBackToWav = 0;
       _progress = const AudioExportProgress(done: 0, total: 0, failed: 0);
     });
 
@@ -141,6 +168,17 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
       onProgress: (progress) {
         if (mounted) setState(() => _progress = progress);
       },
+      // ★v1.21.45 改动 5：选了 MP3 就逐片转换；转不成就把 WAV 当产物（不丢文件）
+      convert: _format == AudioExportFormat.mp3
+          ? (part) async {
+              final bool ok = await LameEncoder.convertInMusicDir(
+                wavFileName: part.wavFileName,
+                mp3FileName: part.fileName,
+              );
+              if (!ok && mounted) _fellBackToWav++;
+              return ok;
+            }
+          : null,
     );
     await synth.dispose();
     if (!mounted) return;
@@ -230,6 +268,41 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
                   ],
                   const SizedBox(height: 12),
                   Text(_estimate, style: theme.textTheme.bodySmall),
+                  const SizedBox(height: 16),
+                  // ★v1.21.45 改动 5：格式选择（默认 MP3）
+                  Text(
+                    '音频格式',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SegmentedButton<AudioExportFormat>(
+                    key: const ValueKey<String>('export-format'),
+                    showSelectedIcon: false,
+                    segments: <ButtonSegment<AudioExportFormat>>[
+                      for (final f in AudioExportFormat.values)
+                        ButtonSegment<AudioExportFormat>(
+                          value: f,
+                          label: Text(f.label),
+                        ),
+                    ],
+                    selected: <AudioExportFormat>{_format},
+                    onSelectionChanged: _running
+                        ? null
+                        : (selection) => _setFormat(selection.first),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(_format.hint, style: theme.textTheme.bodySmall),
+                  if (_format == AudioExportFormat.mp3)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        '个别片段转不成 MP3 时，会自动留成 WAV（不丢文件）。',
+                        style: theme.textTheme.labelSmall,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -349,6 +422,15 @@ class _ExportAudioPageState extends State<ExportAudioPage> {
                 '在「音乐」目录里可以找到这 $succeeded 个文件。',
                 style: theme.textTheme.bodySmall,
               ),
+              // ★v1.21.45 改动 5：如实报告"有几个没转成 MP3"，
+              // 别让用户到文件管理器里才发现格式不对
+              if (_fellBackToWav > 0) ...<Widget>[
+                const SizedBox(height: 4),
+                Text(
+                  '其中 $_fellBackToWav 个片段没能转成 MP3，已按 WAV 保留（能正常播放，就是文件大）。',
+                  style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+                ),
+              ],
             ],
             if (failed > 0) ...<Widget>[
               const SizedBox(height: 8),

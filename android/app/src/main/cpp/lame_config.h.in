@@ -1,0 +1,50 @@
+/*
+ * LAME 的最小 config.h（★v1.21.45 改动 5）
+ *
+ * ## 为什么手写
+ *
+ * LAME 上游用 autotools 生成 config.h：在 Android 上跑 configure 又慢又不稳
+ * （交叉编译探测一堆东西，还得有 msys 环境）。这份手写版只回答一个问题：
+ * **"Android / bionic 上有什么"** —— 够 LAME 编过、且行为与官方发布版一致
+ * （都是 16bit PCM / IEEE754 float 这条路）。
+ *
+ * 由 CMakeLists 用 `configure_file(... COPYONLY)` 拷进构建目录当 `config.h`，
+ * 并用 `-DHAVE_CONFIG_H=1` 让 LAME 的源码去 include 它（上游源码本来就写成
+ * `#ifdef HAVE_CONFIG_H  #include <config.h>  #endif`）。
+ *
+ * ⚠️ 不要删 `ieee754_float32_t` 这两行：`util.h` 直接用它声明 `fast_log2()`，
+ * 而它本来是 autotools 探测出来的（缺了就是 "unknown type name" 编译错误，
+ * 本改动第一次编译就撞上过）。
+ */
+#ifndef LAME_ANDROID_CONFIG_H
+#define LAME_ANDROID_CONFIG_H
+
+/* bionic 是标准 C 库：有这些头文件 —— 少了 STDC_HEADERS，
+   machine.h 会把 memcpy 宏成 bcopy（Android 上没有 bcopy），直接编不过。 */
+#define STDC_HEADERS 1
+#define HAVE_STRING_H 1
+#define HAVE_STRINGS_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_ERRNO_H 1
+#define HAVE_FCNTL_H 1
+#define HAVE_LIMITS_H 1
+#define HAVE_TIME_H 1
+#define HAVE_SYS_TIME_H 1
+#define HAVE_MEMCPY 1
+#define HAVE_MEMMOVE 1
+#define HAVE_STRCHR 1
+#define HAVE_STRRCHR 1
+#define HAVE_STRTOL 1
+#define HAVE_GETTIMEOFDAY 1
+
+/* 浮点类型名（见文件头说明） */
+#define ieee754_float32_t float
+#define ieee754_float64_t double
+
+/* 包信息：LAME 里有个别地方会引用，给个确定的值免得它去找其它头 */
+#define PACKAGE "lame"
+#define PACKAGE_NAME "lame"
+#define VERSION "3.100"
+
+#endif /* LAME_ANDROID_CONFIG_H */

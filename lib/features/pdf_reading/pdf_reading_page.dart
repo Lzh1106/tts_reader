@@ -65,6 +65,21 @@ class PdfReadingPage extends StatefulWidget {
   static const Key noTextLayerKey =
       ValueKey<String>('pdf-reading-no-text-layer');
 
+  /// 扫描件（图片型 PDF）页面上那行提示
+  ///
+  /// ## 措辞演变（两轮用户决定，别改回去）
+  ///
+  /// 1. v1.21.45 前：含糊的"**可能是**扫描件" —— 用户反馈听着像"换个模式就能读"，
+  ///    于是改成点明"要读它得先做 OCR"；
+  /// 2. 2026-10-14 用户拍板：**应用内不做 OCR**（OCR 识别准确率没保证，
+  ///    以后可能走 AI 接口做识别 + 翻译），所以**不再把 OCR 当解决方案挂在提示里**，
+  ///    只说清两件事：**能正常翻阅**、**朗读不了**。
+  ///
+  /// 放在公开类上是为了让单测能直接断言文案（见 `test/scanned_pdf_hint_test.dart`）。
+  static const String scannedPdfHint =
+      '这是扫描件（图片型 PDF），没有文字层，无法朗读。'
+      '可以正常翻页阅读，只是点句朗读用不了。';
+
   /// **一行判据**：视口显示的页 == 朗读句所在页 ？
   ///
   /// ⚠️ 必须放在这个**公开**类上（不能在私有 `PdfReadingPageState` 里），
@@ -485,7 +500,11 @@ class PdfReadingPageState extends State<PdfReadingPage>
         pageCount: pageCount,
         layerLoader: (pageIndex) async {
           if (pageIndex < 0 || pageIndex >= opened.pages.length) return null;
-          return loadTextLayer(opened.pages[pageIndex]);
+          // ★v1.21.45 改动 3：几何异常 → 由本页提示一次（见 _onTextLayerGeometry）
+          return loadTextLayer(
+            opened.pages[pageIndex],
+            onGeometry: _onTextLayerGeometry,
+          );
         },
       );
       if (!mounted) return;
@@ -1907,6 +1926,35 @@ class PdfReadingPageState extends State<PdfReadingPage>
 
   // ---------------- 交互 ----------------
 
+  /// ★v1.21.45 改动 3：已经提示过「文字位置异常」的文档（进程内记忆，按 documentId）
+  ///
+  /// 施工单要求：**同一文档只弹一次**，后续页不重复弹。
+  /// 记成 static 是为了"退出再进同一份 PDF 也不重复烦人" —— 进程内有效即可，
+  /// 重启应用后重新提示一次是合理的。
+  static final Set<String> _geometryWarnedDocs = <String>{};
+
+  @visibleForTesting
+  static void debugResetGeometryWarnings() => _geometryWarnedDocs.clear();
+
+  /// 文字层几何异常 → 提示一次
+  ///
+  /// 只在 [loadTextLayer] 判为异常时被回调；`loadTextLayer` 本身没有 SnackBar 上下文，
+  /// 所以提示挂在这里（施工单明确要求如此）。
+  void _onTextLayerGeometry(PdfTextLayerGeometry geometry) {
+    if (!mounted) return;
+    final String key = widget.documentId ?? widget.filePath;
+    if (!_geometryWarnedDocs.add(key)) return; // 这份文档已经提示过
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          '检测到部分页面的文字位置异常，可能是这份 PDF 本身的问题'
+          '（朗读高亮可能与文字对不齐）',
+        ),
+        duration: Duration(seconds: 6),
+      ),
+    );
+  }
+
   /// 点中某页某句 → 从这里开始（自动连读由会话负责）
   void _readSentence(int pageNumber, int sentenceIndex) {
     final layer = _session.layerOf(pageNumber - 1);
@@ -2252,7 +2300,8 @@ class PdfReadingPageState extends State<PdfReadingPage>
               key: PdfReadingPage.noTextLayerKey,
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                '未检测到可朗读文本（这一页没有文字层，可能是扫描件）',
+                // ★v1.21.45 改动 4：说硬话（文案是公开常量，单测直接断言）
+                PdfReadingPage.scannedPdfHint,
                 style: Theme.of(context).textTheme.bodySmall,
                 textAlign: TextAlign.center,
               ),

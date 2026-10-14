@@ -70,6 +70,25 @@ if ($verifyCode -ne 0) {
   throw "APK 资源自检未通过（exit $verifyCode）：这个包不能交付。先 flutter clean 再重建。"
 }
 
+# ------------------------------------------------ 原生库自检（v1.21.45 起，必须过）
+# MP3 导出依赖 liblame.so（三个 ABI 都要在）。缺了 / 只有 arm64 / 文件被截断，
+# Gradle 一样报 BUILD SUCCESSFUL、exit 0，而真机上要么没 MP3、要么 UnsatisfiedLinkError。
+# 详见 tool\verify_apk_lame.ps1 的文件头。
+Step "[1.3/5] liblame.so 三 ABI 自检"
+$lameScript = Join-Path $root 'tool\verify_apk_lame.ps1'
+if (Test-Path $lameScript) {
+  $prevEapLame = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  & $lameScript -Apk $builtApk | Out-Host
+  $lameCode = $LASTEXITCODE
+  $ErrorActionPreference = $prevEapLame
+  if ($lameCode -ne 0) {
+    throw "liblame.so 自检未通过（exit $lameCode）：这个包不能交付。先跑 tool\build_lame.ps1，再 flutter clean + 重建。"
+  }
+} else {
+  Write-Host "  （跳过：这个版本还没有 tool\verify_apk_lame.ps1）" -ForegroundColor Yellow
+}
+
 # ---------------------------------------------- 源码快照（回退用）
 # 必须在归档 APK 之前就打好：这是「以后能回退到这一版」的唯一保障。
 # 1.20.0 就是没留源码，回退时只能靠抠 APK 字符串重实现 —— 别再来一次。

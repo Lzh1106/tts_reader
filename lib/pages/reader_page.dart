@@ -99,6 +99,17 @@ class ReaderPage extends StatefulWidget {
   /// 正文里**正在朗读的那一句**所在的文本块（用例据此量它在屏幕上的位置）
   static const Key activeSentenceKey = ValueKey<String>('reader-active-sentence');
 
+  /// 扫描件（图片型 PDF）在阅读页顶部横幅上那行提示
+  ///
+  /// ## 措辞（2026-10-14 用户拍板，别改回去）
+  ///
+  /// 应用内**不做 OCR**（准确率没保证，以后可能走 AI 接口做识别 + 翻译），
+  /// 所以提示**不承诺 OCR**，只说清：**能正常翻阅**、**朗读不了**。
+  /// 公开常量便于单测断言文案（见 `test/scanned_pdf_hint_test.dart`）。
+  static const String scannedPdfHint =
+      '这是扫描件（图片型 PDF），没有文字层，无法朗读。'
+      '可以正常翻页阅读，只是点句朗读用不了。';
+
   @override
   State<ReaderPage> createState() => _ReaderPageState();
 }
@@ -1316,8 +1327,8 @@ class _ReaderPageState extends State<ReaderPage> {
               if (_tts.error != null) _banner(_tts.error!, error: true),
               if (_hasTextLayer == false)
                 _banner(
-                  '未检测到文本层（扫描件）：没有可朗读的文字，'
-                  '可切换「原版式」查看页面，或换一份带文本层的 PDF',
+                  // ★v1.21.45 改动 4：说硬话（文案是公开常量，单测直接断言）
+                  ReaderPage.scannedPdfHint,
                 ),
               Expanded(child: _readingArea(cursor)),
               // 控制栏：**关闭朗读模式后整条收起**（用户要求）。

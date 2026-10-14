@@ -174,7 +174,7 @@ void main() {
   /// 用工作区里那份 17.5MB / 812 页的书 —— 正是"主缓存不再背整份行表"要改善的场景。
   /// 没有那份文件就跳过（别人的机器上不一定有）。
   test('大 PDF（17.5MB / 812 页）：冷启动 vs 命中缓存', () async {
-    final Directory media = Directory(Platform.environment['PDF_PERF_SAMPLE'] ?? 'test_assets');
+    final Directory media = Directory(r'C:\Users\user\.dsh\dsh_wechat\媒体');
     if (!media.existsSync()) {
       // ignore: avoid_print
       print('DEVICE_VERIFY[大PDF] 没有那份大 PDF，跳过');

@@ -13,6 +13,7 @@ import 'services/document_service.dart';
 import 'services/download_watcher.dart';
 import 'services/speak_intake.dart';
 import 'services/storage_service.dart';
+import 'services/third_party_licenses.dart';
 import 'theme/app_theme.dart';
 import 'tts/media_interruption.dart';
 import 'tts/tts_audio_handler.dart';
@@ -20,6 +21,9 @@ import 'tts/tts_manager.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 手工引入的原生库（LAME，LGPL-2.0）不在 pub 依赖清单里，
+  // 得自己注册到「开源许可」页 —— 见 registerThirdPartyLicenses 的说明
+  registerThirdPartyLicenses();
   // 兜底：任何未捕获异常都落盘（logcat 重启就没，文件能留下来）
   await CrashLog.install();
   CrashLog.mark('main() 开始');

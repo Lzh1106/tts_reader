@@ -34,6 +34,19 @@ class TtsAudioHandler extends BaseAudioHandler {
       if (!source.hasSession) return;
       source.playFromCursor();
     };
+    // ★v1.21.45 改动 1：**长打断结束**只重推一次播放状态，不碰播放。
+    //
+    // 真机现象：被别的应用抢走音频焦点（长打断）之后，**耳机键失效**，
+    // 而应用内按钮与通知栏按钮都正常 → 怀疑系统在此期间把我们当成"非活跃媒体"。
+    // 长打断结束时重推一次 `playbackState`，让系统重新把我们标成活跃媒体，
+    // 媒体键的路由就会回来。
+    //
+    // ⚠️ 这是**第一轮尝试**，根因未定性：真机验收要看日志里有没有
+    // `媒体控制[pushState]`。若一条都没有 / 按键仍无效，说明重推状态不足以改路由，
+    // 下一步才动焦点策略（见交接文档「耳机修复无效时的下一步」）。
+    MediaInterruptionController.instance.notifyAfterInterruptionEnded = () async {
+      _pushState();
+    };
   }
 
   static const String _notificationChannelId = 'com.example.tts_reader.audio';

@@ -1,4 +1,4 @@
-# 给当前源码打一份**版本快照**，方便以后回退
+﻿# 给当前源码打一份**版本快照**，方便以后回退
 #
 # 为什么需要它：2026-10-08 回退到 1.20.0 时发现——**1.20.0 的源码根本没留**
 # （只归档过 APK，git 里也只有 v1.15.0 一个提交）。结果「回退源码」只能靠
@@ -90,8 +90,7 @@ foreach ($item in Get-ChildItem $root -Force) {
 
 # 清单：记下「这份快照是什么」——回退时靠它确认
 $gitCommit = ''
-$gitExe = (Get-Command git -ErrorAction SilentlyContinue).Source
-if (-not $gitExe -and (Test-Path 'C:\ttsbuild\git\cmd\git.exe')) { $gitExe = 'C:\ttsbuild\git\cmd\git.exe' }
+$gitExe = 'C:\ttsbuild\git\cmd\git.exe'
 if (Test-Path $gitExe) {
   try {
     $gitCommit = (& $gitExe -C $root rev-parse --short HEAD 2>$null | Select-Object -First 1)

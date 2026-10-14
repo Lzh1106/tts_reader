@@ -99,12 +99,15 @@ void main() {
 
     test('来电/其它播放器抢焦点仍然会暂停（这条没有放宽）', () async {
       var paused = 0;
-      var resumed = 0;
+      var notified = 0;
       MediaInterruptionController.instance.pauseForInterruption = () async {
         paused++;
       };
-      MediaInterruptionController.instance.resumeAfterInterruption = () async {
-        resumed++;
+      // ⚠️ v1.21.45 改动 1：长打断结束**不再自动继续**（暂缓那条），
+      // 只重推一次播放状态。所以这里断言的是"照旧暂停 + 结束时重推状态"。
+      MediaInterruptionController.instance.notifyAfterInterruptionEnded =
+          () async {
+        notified++;
       };
 
       MediaInterruptionController.instance.debugInterrupt(
@@ -118,7 +121,7 @@ void main() {
         begin: false,
       );
       await Future<void>.delayed(const Duration(milliseconds: 30));
-      expect(resumed, 1, reason: '打断结束后要自动继续');
+      expect(notified, 1, reason: '打断结束后要重推一次播放状态（耳机键路由）');
     });
     // ---- v1.21.39：提示音（duck）与视频（pause）必须区分对待 ----
     test('提示音（duck）：先让位，对方马上走了就自动接回', () async {
@@ -175,27 +178,42 @@ void main() {
       print('DEVICE_VERIFY[media-duck] 视频：paused=$paused resumed=$resumed');
     });
 
-    test('系统要求暂停：先暂停；结束后自动继续', () async {
+    test('★长打断（视频 / 来电）结束：**不自动接回**，但会重推一次播放状态', () async {
+      // ⚠️ v1.21.45 改动 1 改了这条的行为（原来断言 resumed == 1）：
+      // 「长打断结束后自动恢复朗读」已明确**暂缓**（另一条独立问题链，见交接文档），
+      // 现在长打断结束只重推 playbackState —— 目的是把**耳机键路由**抢回来。
       var paused = 0;
       var resumed = 0;
+      var notified = 0;
       MediaInterruptionController.instance.pauseForInterruption = () async {
         paused++;
       };
       MediaInterruptionController.instance.resumeAfterInterruption = () async {
         resumed++;
       };
+      MediaInterruptionController.instance.notifyAfterInterruptionEnded =
+          () async {
+        notified++;
+      };
 
-      // 来电 / 别的播放器抢焦点
+      // 来电 / 别的播放器持续抢焦点
       MediaInterruptionController.instance
           .debugInterrupt(AudioInterruptionType.pause);
       await Future<void>.delayed(Duration.zero);
       expect(paused, 1, reason: '打断开始应当暂停朗读');
 
+      // ★长打断进行中：两个"结束"回调都不该被调
+      expect(resumed, 0);
+      expect(notified, 0, reason: '对方还没结束，不该重推状态');
+
       // 对方结束
       MediaInterruptionController.instance
           .debugInterrupt(AudioInterruptionType.pause, begin: false);
       await Future<void>.delayed(Duration.zero);
-      expect(resumed, 1, reason: '打断结束应当自动继续');
+      expect(resumed, 0,
+          reason: '★长打断结束**不自动恢复朗读**（本轮明确暂缓那条）');
+      expect(notified, 1,
+          reason: '★要重推一次播放状态：让系统重新把我们标成活跃媒体，耳机键路由回来');
     });
 
     test('用户自己暂停过：打断结束后不自动继续', () async {
@@ -219,6 +237,31 @@ void main() {
       // 用户按了播放：之后又可以被自动继续
       MediaInterruptionController.instance.notifyUserResumed();
       expect(MediaInterruptionController.instance.debugUserPaused, isFalse);
+    });
+
+    test('★短打断（提示音）结束：仍然自动接回 —— v1.21.39 行为回归', () async {
+      var resumed = 0;
+      var notified = 0;
+      MediaInterruptionController.instance.resumeAfterInterruption = () async {
+        resumed++;
+      };
+      MediaInterruptionController.instance.notifyAfterInterruptionEnded =
+          () async {
+        notified++;
+      };
+
+      // 系统提示音：duck 起来，然后在短打断窗口内结束
+      MediaInterruptionController.instance
+          .debugInterrupt(AudioInterruptionType.duck);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      MediaInterruptionController.instance
+          .debugInterrupt(AudioInterruptionType.duck, begin: false);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(resumed, 1,
+          reason: '★★短打断必须照旧自动接回（用户明确要求：这条行为不许动）');
+      expect(notified, 0,
+          reason: '短打断走自动接回那条路，不需要重推状态');
     });
 
     test('duck（导航播报 / 提示音）也要让位 —— 但会自己接回', () async {
