@@ -262,11 +262,26 @@ class ParagraphReflow {
     );
   }
 
-  /// 段落列表的内容是否完全一致（段数 + 每段文本）
+  /// 段落列表的内容是否完全一致（段数 + 每段文本 + **每段的分句**）
+  ///
+  /// ⚠️ 为什么必须连**分句**一起比（v1.21.47 踩到）：
+  /// 原来只比段落文本，于是「段落没变、但句子的切分变了」会被判成"无变化" →
+  /// `ReflowReport.chapters == null` → **用户点了「自动排版」什么都不会发生**。
+  /// 真机回归用例：`test/reader_auto_format_test.dart` 的"点一次排版应当开启并落盘"，
+  /// 在 v1.21.47 改分句规则（不再把英文缩写 `H.` / 小数点切成句）之后**变红** ——
+  /// 因为那一页重排后的段落文本与原文一字不差，可句子已经不同了。
+  ///
+  /// 「排版」这件事本来就要重算分句（朗读的停顿位置跟着变），所以分句变也算变。
   static bool _sameParagraphs(List<Paragraph> a, List<Paragraph> b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
       if (a[i].text != b[i].text) return false;
+      final sa = a[i].sentences;
+      final sb = b[i].sentences;
+      if (sa.length != sb.length) return false;
+      for (var s = 0; s < sa.length; s++) {
+        if (sa[s].text != sb[s].text) return false;
+      }
     }
     return true;
   }

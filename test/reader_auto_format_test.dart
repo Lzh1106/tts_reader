@@ -17,25 +17,37 @@ import 'package:tts_reader/tts/tts_manager.dart';
 void main() {
   /// 造一份会**因为排版而改变**的 PDF
   ///
-  /// 每页都是「一句话被硬折行切成 4 行」，三页 → 未排版时 3 段（每页一段）、
-  /// 排版后仍是 3 段但**每段内部的句子被接回整句**。
-  /// 为了让「形态」可比较，这里让重排前后**段落里的句子数**不同：
-  /// 每页画 4 行，其中第 1~2 行构成一句、第 3~4 行构成另一句。
+  /// ⚠️ 2026-10-14 重做（v1.21.47）：原来的 fixture（每页 4 行、画到 520pt 宽）
+  /// **测不出东西了**，用例因此变红。两处失真的原因都记在这里，别再踩：
+  ///
+  /// 1. **行宽不够**：解析器只把"排满右边界"的行判为硬折行
+  ///    （`ParagraphReflow.wrappedRatio`：行右边界 ≥ 最宽行的 88%）。
+  ///    原来那 4 行只占 520pt 的一半，判不出来 → 原文本来就已经是整句。
+  /// 2. **整页字数不够**：`DocumentService` 的 PDF 路径只有在
+  ///    **单页文本 > 400 字**时才按行分段（否则整页挤成一段）——
+  ///    原来一页才 154 字，连"分行"这一步都没走到。
+  ///
+  /// 所以 fixture 要**又窄又长**：窄栏（320pt，每行 ~50 字符会顶到边界）
+  /// + 每页 3 组 × 3 行（9 行 ≈ 470 字）。这样：
+  /// - 未排版：每页 9 段（每行一段，句子被折行切断）；
+  /// - 排版后：每页 1 段（整页接回一个自然段）→ 段落数与文本都变了 → `changed=true`。
   File makePdf(Directory dir) {
     final file = File('${dir.path}/reflow.pdf');
     final pdf = PdfDocument();
     final font = PdfStandardFont(PdfFontFamily.helvetica, 11);
+    const double columnWidth = 320;
     for (var page = 0; page < 3; page++) {
       final graphics = pdf.pages.add().graphics;
       final lines = <String>[
-        'Page $page first sentence begins here and the',
-        'typesetter broke it across two lines, then the',
-        'second sentence begins here and it is also',
-        'broken across two lines by the layout engine.',
+        for (var g = 0; g < 3; g++) ...<String>[
+          'Page $page group $g first sentence begins here and',
+          'the typesetter broke it across two lines, then the',
+          'second sentence begins here and it is also broken',
+        ],
       ];
       for (var i = 0; i < lines.length; i++) {
         graphics.drawString(lines[i], font,
-            bounds: Rect.fromLTWH(40, 40 + i * 18, 520, 18));
+            bounds: Rect.fromLTWH(40, 40 + i * 18, columnWidth, 18));
       }
     }
     file.writeAsBytesSync(pdf.saveSync());

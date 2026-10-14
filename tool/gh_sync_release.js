@@ -60,13 +60,27 @@ async function api(pathname, options = {}, attempt = 0) {
 /** 递归列出发布树里所有文件（相对路径，POSIX 分隔） */
 function listFiles(root) {
   const out = [];
+  // 与发布树 .gitignore 对齐的排除项（发布树是白名单复制出来的，
+  // 这里再挡一道：机器相关 / 可再生的文件不该进公开仓库）
+  const skip = [
+    /(^|\/)\.gradle\//,
+    /(^|\/)build\//,
+    /(^|\/)local\.properties$/,
+    /(^|\/)key\.properties$/,
+    /gradle-wrapper\.jar$/,
+    /\.jks$/,
+    /\.keystore$/,
+  ];
+  const ignored = (rel) => skip.some((re) => re.test(rel));
   const walk = (dir) => {
     for (const name of fs.readdirSync(dir)) {
       if (name === '.git') continue;
       const full = path.join(dir, name);
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      if (ignored(rel + (fs.statSync(full).isDirectory() ? '/' : ''))) continue;
       const st = fs.statSync(full);
       if (st.isDirectory()) walk(full);
-      else if (st.isFile()) out.push(path.relative(root, full).split(path.sep).join('/'));
+      else if (st.isFile()) out.push(rel);
     }
   };
   walk(root);

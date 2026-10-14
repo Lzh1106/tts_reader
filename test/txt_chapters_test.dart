@@ -243,4 +243,77 @@ void main() {
       expect(chapters.last.paragraphs.length, 2);
     });
   });
+
+  // ============================================================ 分句
+  //
+  // 起因（2026-10-14 真机）：用户报「**epub 把一个字母当一句话**」，
+  // 并指出「这是之前在 pdf 上修好的 bug」。查明：
+  //   · PDF 那条路（`pdf_text_layer._isSentenceEnd`）早就对小点数 / 缩写 / 句尾标点
+  //     做了保护；
+  //   · EPUB / TXT 走的是 `DocumentTextSplitter.splitSentences`，**只有一个光秃秃的
+  //     正则** `[^。！？!?\.\n]+[。！？!?\.]*` —— 每个点号都当句末。
+  // 用户那本书（《一八七一年巴黎公社史》）实测：**741 条 ≤2 字符的"句子"**，
+  // 全是 `H.` / `A.` / `Ф.` / `…”` 这种碎片；朗读时一句一停，还会让引擎超时。
+  group('分句：不能把缩写 / 小数点 / 句尾引号切成碎片', () {
+    List<String> parts(String text) =>
+        DocumentTextSplitter.splitSentences(text).map((s) => s.text).toList();
+
+    test('外国人名缩写不断句（"一个字母当一句话"的正主）', () {
+      // 真机原文形态：`…(J.` / `N.` / `Clapham…` 被切成三句
+      final s = parts('参见克拉彭:《近代英国经济史》(J. N. Clapham, '
+          'An Economic History of Moden Britain)第2卷。');
+      expect(s.length, 1, reason: '缩写点不是句末，整段应当只有一句：$s');
+      expect(s.first, contains('J. N. Clapham'));
+    });
+
+    test('西里尔 / 希腊字母的缩写同样不断（那本书里有 Ф. Β. И.）', () {
+      final s = parts('作者 Ф. Β. 与 И. 都引用了它。');
+      expect(s.length, 1, reason: '非 ASCII 缩写也要认：$s');
+    });
+
+    test('小数点不断句', () {
+      final s = parts('圆周率约等于 3.14 左右。');
+      expect(s.length, 1, reason: '3.14 不是两句：$s');
+    });
+
+    test('句末标点后的收尾引号归本句，不单独成句', () {
+      final s = parts('他说：“走吧。”然后离开了。');
+      expect(s.length, 2, reason: '应当两句：$s');
+      expect(s[0], '他说：“走吧。”', reason: '收尾引号要留在本句：$s');
+      expect(s[1], '然后离开了。');
+      // 关键负向判据：不能出现只有引号/标点的"句子"
+      for (final one in s) {
+        expect(one.trim().length, greaterThan(1),
+            reason: '不允许切出 1 字符的碎片：「$one」');
+      }
+    });
+
+    test('省略号不当句末（中文里它多在句中）', () {
+      final s = parts('他犹豫了一下……然后走了。');
+      expect(s.length, 1, reason: '… 不断句：$s');
+    });
+
+    test('正常中文分句不受影响', () {
+      final s = parts('第一句。第二句！第三句？');
+      expect(s, <String>['第一句。', '第二句！', '第三句？']);
+    });
+
+    test('句末点号后面跟换行也照常断', () {
+      final s = parts('第一行结束。\n第二行开始。');
+      expect(s.length, 2, reason: '$s');
+    });
+
+    test('回归钉子：真机那本书的碎片形态不再出现', () {
+      // 这一串就是真机日志里被切碎的那一段（人名缩写 + 括号 + 收尾引号）
+      const raw = '耶罗费耶夫:《1832—1917年英国史纲》,莫斯科,1959; J. N. '
+          '克拉彭:《近代英国经济史》(J. N. Clapham)第2卷,剑桥,1932;'
+          'W. 佩奇编:《1815—1914年的工商业》。';
+      final s = parts(raw);
+      for (final one in s) {
+        final t = one.trim();
+        expect(t.length, greaterThan(2),
+            reason: '不允许再出现 ≤2 字符的碎片「$t」（全书 741 条就是这么来的）');
+      }
+    });
+  });
 }

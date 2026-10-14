@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tts_reader/features/pdf_reading/pdf_read_session.dart';
 import 'package:tts_reader/features/pdf_reading/pdf_text_layer.dart';
 import 'package:tts_reader/models/structured_document.dart';
+import 'package:tts_reader/pages/home_page.dart';
 import 'package:tts_reader/services/storage_service.dart';
 import 'package:tts_reader/tts/tts_engine.dart';
 import 'package:tts_reader/tts/tts_manager.dart';
@@ -232,6 +233,90 @@ void main() {
     await mountBar(tester);
     final title = await shownTitle(tester);
     expect(title, '我的PDF书', reason: '暂停中的 PDF 仍应被控制栏显示');
+  });
+
+  // ============================== 「返回朗读页」的目标必须与显示同源（v1.21.47）
+  //
+  // 用户报：**EPUB 正在朗读时，文档库控制栏显示的书名是对的，点进去却跳到 PDF**；
+  //         暂停再进才正常。
+  //
+  // 根因：`HomePage._openReadingPage` 原来用 `pdf.isActive`（只要会话在就算），
+  //       而控制栏显示用 `pdf.isPlaybackActive`（存在 **且** 在播/暂停）。
+  //       PDF 被 EPUB 顶停后 `isActive` 仍为 true → 显示 EPUB、跳转却去问 PDF。
+  // 与 §4.103 是同一族问题：**同一个"活跃"概念，两处判据必须一致。**
+  group('「返回朗读页」跳哪本书：判据必须与控制栏一致', () {
+    testWidgets('PDF 已停播但会话还在 → 必须跳到**正在朗读的 EPUB**', (tester) async {
+      final tts = TtsManager.instance;
+      final pdf = PdfReadSession.instance;
+
+      // 1) PDF 在播
+      await tester.runAsync(() => pdf.open(
+            documentId: 'pdfA',
+            title: '我的PDF书',
+            pageCount: 50,
+            layerLoader: (i) async => null,
+          ));
+      pdf.startAt(const PdfSentenceRef(pageIndex: 0, sentenceIndex: 0, text: '句'));
+      await tester.runAsync(() => pdf.stopSound()); // 换书时 PDF 被"停声但保留会话"
+      await tester.pump(const Duration(milliseconds: 200));
+
+      // 2) EPUB/TXT 起来
+      tts.loadDocument(doc('T'), title: '我的TXT书', documentId: 'epubB');
+      tts.speakFrom(0, 0, 0);
+      await tester.pump(const Duration(milliseconds: 200));
+
+      // 前提核对：这正是"两处判据会分叉"的那个状态
+      expect(pdf.isActive, isTrue, reason: '前提：停声后会话仍在（isActive 为 true）');
+      expect(pdf.isPlaybackActive, isFalse, reason: '前提：它没在播也不算活跃');
+
+      final target = HomePage.readingTargetDocumentId(pdf: pdf, tts: tts);
+      // ignore: avoid_print
+      print('DBG test: 返回朗读页目标=$target '
+          '(pdf.isActive=${pdf.isActive} pdf.isPlaybackActive=${pdf.isPlaybackActive} '
+          'tts.doc=${tts.activeDocumentId})');
+      expect(target, 'epubB',
+          reason: '控制栏显示的是 EPUB，跳转就必须去 EPUB —— 用 pdf.isActive 会跳错到停播的 PDF');
+    });
+
+    testWidgets('PDF 在播 → 仍以 PDF 为准（不能被误伤）', (tester) async {
+      final tts = TtsManager.instance;
+      final pdf = PdfReadSession.instance;
+      await tester.runAsync(() => pdf.open(
+            documentId: 'pdfA',
+            title: '我的PDF书',
+            pageCount: 50,
+            layerLoader: (i) async => null,
+          ));
+      pdf.startAt(const PdfSentenceRef(pageIndex: 0, sentenceIndex: 0, text: '句'));
+
+      expect(pdf.isPlaybackActive, isTrue, reason: '前提：PDF 正在播');
+      expect(
+        HomePage.readingTargetDocumentId(pdf: pdf, tts: tts),
+        'pdfA',
+        reason: '两个来源都在时 PDF 优先（与控制栏一致）',
+      );
+      // 收尾：PDF 的推进循环会挂 80ms 定时器，测试结束前必须停掉，
+      // 否则 `pumpWidget` 收尾会报 "A Timer is still pending"（假红）
+      await tester.runAsync(() => pdf.stopSound());
+      await tester.pump(const Duration(milliseconds: 200));
+    });
+
+    testWidgets('PDF 暂停中 → 仍算活跃，跳转仍去 PDF', (tester) async {
+      final tts = TtsManager.instance;
+      final pdf = PdfReadSession.instance;
+      await tester.runAsync(() => pdf.open(
+            documentId: 'pdfA',
+            title: '我的PDF书',
+            pageCount: 50,
+            layerLoader: (i) async => null,
+          ));
+      pdf.startAt(const PdfSentenceRef(pageIndex: 0, sentenceIndex: 0, text: '句'));
+      await tester.runAsync(() => pdf.pause());
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(pdf.isPlaybackActive, isTrue, reason: '暂停仍算活跃');
+      expect(HomePage.readingTargetDocumentId(pdf: pdf, tts: tts), 'pdfA');
+    });
   });
 }
 

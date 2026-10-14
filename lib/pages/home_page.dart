@@ -41,6 +41,34 @@ enum DocumentSort {
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
+  /// 「返回朗读页」该跳去哪本书（**纯函数，便于单测钉住**）
+  ///
+  /// ## ⚠️ 判据必须与控制栏一致：`isPlaybackActive`，不是 `isActive`
+  ///
+  /// 用户报的现象：**EPUB 正在朗读时，文档库控制栏显示的书名是对的，点进去却跳到 PDF**；
+  /// 暂停再进才正常。
+  ///
+  /// 根因就是这里原来用的是 `pdf.isActive`：
+  /// - 控制栏显示走的是 `pdf.isPlaybackActive`（§4.103 的口径：**存在 且 在播/暂停**）→ 显示 EPUB ✅
+  /// - 而这里用的是 `pdf.isActive`（只要会话还在就算）→ PDF 被 EPUB 顶停之后它**仍为 true**，
+  ///   于是跳转去问它、拿到的是那本**已经停掉的 PDF** ❌
+  ///
+  /// 两处判据不一致 → 标题与跳转指向两本书。暂停（或停止）之后 PDF 会话真的结束了，
+  /// `isActive` 才变 false，所以"暂停再进就正常"。
+  ///
+  /// `reading_control_bar.dart` 的 `_pickSource` 里有一整段注释专门讲过这个坑，
+  /// 但本方法当时漏改了 —— 两处**必须用同一个判据**，改动时请一起看。
+  ///
+  /// 顺序：PDF 优先（两个来源都可能正在读时，PDF 的位置更"重"，用户刚看过那一页）。
+  @visibleForTesting
+  static String? readingTargetDocumentId({
+    required PdfReadSession pdf,
+    required TtsManager tts,
+  }) {
+    if (pdf.isPlaybackActive) return pdf.documentId;
+    return tts.activeDocumentId;
+  }
+
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -126,13 +154,13 @@ class _HomePageState extends State<HomePage> {
 
   // ---------------- 底部朗读控制栏 ----------------
 
-  /// 跳回正在朗读的那本书的阅读页（控制栏上的「返回朗读页」）
+  /// 「返回朗读页」该跳去哪本书 —— 判据见 [HomePage.readingTargetDocumentId]
   Future<void> _openReadingPage() async {
     final messenger = ScaffoldMessenger.of(context);
-    // PDF 会话是**平行单例**：先问它，再问 TtsManager
-    // （两个来源都可能正在读，PDF 优先 —— 见 reading_control_bar 的分派说明）
-    final pdf = PdfReadSession.instance;
-    final id = pdf.isActive ? pdf.documentId : TtsManager.instance.activeDocumentId;
+    final id = HomePage.readingTargetDocumentId(
+      pdf: PdfReadSession.instance,
+      tts: TtsManager.instance,
+    );
     if (id == null) {
       messenger.showSnackBar(const SnackBar(content: Text('当前朗读的是文本片段，没有对应的阅读页')));
       return;
