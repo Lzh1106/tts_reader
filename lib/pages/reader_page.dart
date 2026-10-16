@@ -4,6 +4,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+// `RenderParagraph`（实测句子的真实排版盒，见 `_measureSentenceInParagraph`）
+import 'package:flutter/rendering.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
@@ -394,6 +396,12 @@ class _ReaderPageState extends State<ReaderPage> {
     final cursor = _tts.cursor;
     if (cursor.$1 < 0 || cursor.$1 >= _doc!.chapters.length) return;
     _readingSpot = cursor;
+    // 观测①：游标变更收到（哪一句、第几章、段内句号）
+    _followLog(
+      '游标',
+      '章=${cursor.$1} 段=${cursor.$2} 句=${cursor.$3} '
+      'speaking=${_tts.speaking} playing=${_tts.playing} paused=${_tts.paused}',
+    );
     // 朗读位置变了，按钮的显示也要跟着刷（用户可能停在同一页的另一段，
     // 也可能已经翻到别的页）—— 只在滚动通知里刷会漏掉这些情况。
     _syncBackToReading();
@@ -685,29 +693,122 @@ class _ReaderPageState extends State<ReaderPage> {
 
   /// 把视图（正文列表 / PDF 页）对齐到某个位置
   void _alignTo((int, int, int) spot) {
-    if (!mounted) return;
+    if (!mounted) {
+      _followLog('进入定位', 'spot=$spot 但已 unmounted');
+      return;
+    }
     final document = _doc;
-    if (document == null || document.chapters.isEmpty) return;
+    if (document == null || document.chapters.isEmpty) {
+      _followLog('进入定位', 'spot=$spot 但文档未就绪（doc=${document == null ? "null" : "空章"}）');
+      return;
+    }
     final chapter = spot.$1.clamp(0, document.chapters.length - 1);
+    // 观测⑤：进入阅读页定位 —— 请求的 spot 与当前 TTS 游标是否一致
+    _followLog(
+      '进入定位',
+      'spot=$spot 夹取章=$chapter 块数=${_blocks.length} '
+      'tts游标=${_tts.cursor} 视图位置=$_lastSpot 朗读位置=$_readingSpot '
+      '落定页=$_displayedPage 目标页=$_pageIndex',
+    );
     if (_isPdf && !_pdfTextView) {
       // 原版式：一章即一页。文档还没加载完就先记下来，
       // 等 onDocumentLoaded 再跳 —— 否则这次跳页会被视图丢掉，
       // 表现就是「重进回到了第 1 页」。
       if (!_pdfReady) {
         _pendingPdfPage = chapter + 1;
+        _followLog('进入定位', 'PDF 未就绪 → 记下待跳页=${chapter + 1}');
         return;
       }
       _goToPdfPage(chapter + 1);
       return;
     }
-    if (_blocks.isEmpty) return;
+    if (_blocks.isEmpty) {
+      _followLog('进入定位', '★块列表为空 → 定位无法执行（spot=$spot）');
+      return;
+    }
     final paragraphs = document.chapters[chapter].paragraphs;
     if (paragraphs.isEmpty) {
       unawaited(_revealBlock(_chapterBlockIndex(chapter)));
       return;
     }
     final paragraph = spot.$2.clamp(0, paragraphs.length - 1);
-    unawaited(_revealBlock(_chapterBlockIndex(chapter) + 1 + paragraph));
+    final block = _chapterBlockIndex(chapter) + 1 + paragraph;
+    unawaited(_revealBlock(block));
+    // ★v1.21.53：进入定位**不能只管段落**。
+    //
+    // 「重回阅读页有概率不在朗读位置」的根因之一就在这里：
+    // 原来只 `_revealBlock`（把**段落**按 alignment 拉进视野）就结束了，
+    // 而一个中文字幕段落常常比视口高好几倍 —— 段落进视野 ≠ **那一句**进视野。
+    // 于是「页对了、段对了，但正在读的那句在屏幕外」，用户看到的就是
+    // 「回到朗读页却不在朗读位置」。
+    //
+    // 修法（对照 PDF 的做法）：`_revealBlock` 之后**再校验一次「句子可见」**，
+    // 不可见就按句对齐；并且**等布局稳定后再补一次**（PDF 是逐帧收敛最多 24 帧）。
+    // 这里用「帧后 → 再等一帧 → 校验 → 必要时对齐」的有限轮次，不做无限重试。
+    unawaited(_alignToSentenceAfterLayout(chapter, paragraph, spot.$3));
+  }
+
+  /// ★负向自检专用开关（**必须保持 false**）：置 true 则跳过句子级进入定位
+  static const bool _negativeSkipEntryAlign = false;
+
+  /// 进入阅读页的**句子级**定位（在段落定位之后跑）
+  ///
+  /// 与 PDF `_revealToPageIndex` 的逐帧收敛同义：目标可能还没建出来
+  /// （ListView 惰性构建），所以要跨几帧重试；但轮次必须有限，
+  /// 否则会和后续的跟随滚动抢同一个控制器（那正是「页面乱抽」的来源）。
+  Future<void> _alignToSentenceAfterLayout(
+    int chapter,
+    int paragraph,
+    int sentence,
+  ) async {
+    if (_negativeSkipEntryAlign) return; // ★负向自检开关
+    for (var attempt = 0; attempt < 8; attempt++) {
+      await _nextFrame();
+      if (!mounted) return;
+      if (_userScrolling || _pageTurning || _inPageSettleWindow) continue;
+      final block = _paragraphBlockIndex(chapter, paragraph);
+      if (block < 0) return;
+      // 用**请求恢复的那个 spot** 量几何（不是 `_tts.highlightCursor` —— 那条在
+      // 没朗读时恒为 null，见 `_geometryForCursor` 的说明）。
+      final geometry = _geometryForCursor((chapter, paragraph, sentence));
+      if (geometry == null) {
+        // 段落还没建出来 / 视口没就绪：这一轮跳过，等下一帧
+        continue;
+      }
+      // 句心是否已落在「可见范围」内（用比舒适区更宽的可接受区间：
+      // 这里的目标是「看得见、且不是贴着边缘」，不是把它对齐到 38% ——
+      // 对齐留给用户点「回到朗读页」那种显式指令）
+      final h = geometry.height;
+      final top = geometry.sentenceTop;
+      final visible = top >= h * 0.05 && top <= h * 0.85;
+      _followLog(
+        '进入定位校验',
+        '第${attempt + 1}轮 章=$chapter 段=$paragraph 句=$sentence 块=$block '
+        '句心=${top.toStringAsFixed(1)} 视口高=${h.toStringAsFixed(0)} '
+        '可见=$visible $_lastSentenceMeasure',
+      );
+      if (visible) {
+        _followLog('进入定位完成', '章=$chapter 段=$paragraph 句=$sentence 已在视野内');
+        return;
+      }
+      // 不可见：按句对齐一次（复用跟随滚动的对齐口径），下一轮再校验
+      final scroll = _pageScroll(_displayedPage);
+      if (!scroll.hasClients) continue;
+      final position = scroll.position;
+      final want = (position.pixels + top - h * 0.38)
+          .clamp(0.0, position.maxScrollExtent);
+      if ((want - position.pixels).abs() < 2) continue;
+      _followLog(
+        '进入定位补正',
+        '句心=${top.toStringAsFixed(1)} 不在可见区 → 对齐目标=${want.toStringAsFixed(1)}',
+      );
+      await scroll.animateTo(
+        want,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+      ).catchError((Object _) {});
+    }
+    _followLog('进入定位结束', '章=$chapter 段=$paragraph 句=$sentence 轮次用尽');
   }
 
   /// EPUB 首次打开时抽取封面；已有封面则不重复抽取
@@ -2273,6 +2374,73 @@ class _ReaderPageState extends State<ReaderPage> {
   @visibleForTesting
   List<String> get debugCrashLog => CrashLog.recent;
 
+  /// 「视图位置」（用户停在哪 / 退出时写回哪个 spot）（**只给测试看**）
+  ///
+  /// 「重回阅读页不在朗读位置」那条用例要断的就是它：退出再进来之后，
+  /// 这里必须等于**朗读句**，而不是段首。
+  @visibleForTesting
+  (int, int, int) get debugLastSpot => _lastSpot;
+
+  /// 「朗读位置」（独立于视图位置，见 [_readingSpot]）（**只给测试看**）
+  @visibleForTesting
+  (int, int, int)? get debugReadingSpot => _readingSpot;
+
+  /// 显式给一个 spot，量它的句心几何（**只给测试看**）
+  ///
+  /// 「重回阅读页」的用例要在**朗读已停**时验证"那一句进视野了没"，
+  /// 而 [debugSentenceGeometry] 依赖 `_tts.highlightCursor`（停读时为 null），
+  /// 所以这里用请求恢复的 spot 来量 —— 与生产代码 `_alignToSentenceAfterLayout`
+  /// 走的是同一条 `_geometryForCursor`。
+  @visibleForTesting
+  Map<String, Object?>? debugGeometryForSpot((int, int, int) spot) {
+    final geometry = _geometryForCursor(spot);
+    if (geometry == null) {
+      return <String, Object?>{'null': true, 'measureTag': _lastSentenceMeasure};
+    }
+    final block = _paragraphBlockIndex(spot.$1, spot.$2);
+    final measured = _measureSentenceInParagraph(block, spot.$1, spot.$2, spot.$3);
+    return <String, Object?>{
+      'sentenceCenter': geometry.sentenceTop,
+      'viewportHeight': geometry.height,
+      'measureTag': _lastSentenceMeasure,
+      'topInParagraph': measured?.top,
+      'bottomInParagraph': measured?.bottom,
+    };
+  }
+
+  /// 当前朗读句的**实测**几何（**只给测试看**）
+  ///
+  /// 返 `null` 表示量不到。字段含义：
+  /// * `sentenceCenter` —— 句心相对视口顶的偏移（负值 = 已在视口上方）
+  /// * `measured` —— 这一句是用**实测**还是退回**估算**得到的
+  /// * `centerInParagraph` —— 句心相对段落文字块顶部的偏移（实测时才有意义）
+  ///
+  /// 为什么用例必须能直接看到"实测还是估算"：这次的 bug 正是"估算把软换行
+  /// 当成没有换行"，只看屏幕截图分不清是"判据错"还是"滚动没跑"。
+  @visibleForTesting
+  Map<String, Object?>? debugSentenceGeometry() {
+    final cursor = _tts.highlightCursor;
+    if (cursor == null) return null;
+    final geometry = _geometryForCursor(cursor);
+    if (geometry == null) return null;
+    final block = _paragraphBlockIndex(cursor.$1, cursor.$2);
+    final measured = _measureSentenceInParagraph(
+      block,
+      cursor.$1,
+      cursor.$2,
+      cursor.$3,
+    );
+    return <String, Object?>{
+      'cursor': cursor,
+      'sentenceCenter': geometry.sentenceTop,
+      'viewportHeight': geometry.height,
+      'measured': measured != null,
+      'measureTag': _lastSentenceMeasure,
+      'topInParagraph': measured?.top,
+      'bottomInParagraph': measured?.bottom,
+    };
+  }
+
   /// PDF 原版式是否已进入朗读模式（**只给测试看**）
   @visibleForTesting
   bool get debugPdfReadMode => _pdfReadMode;
@@ -2468,6 +2636,47 @@ class _ReaderPageState extends State<ReaderPage> {
     final scroll = _pageScroll(_displayedPage);
     if (!scroll.hasClients || _blocks.isEmpty) return;
     final pixels = scroll.position.pixels;
+
+    // ★v1.21.53：「重回阅读页有概率不在朗读位置」的另一半根因。
+    //
+    // 跟随滚动的设计是**把正在读的那句放到视口 38% 处**（见 `_followSentence`），
+    // 所以「视口顶端那一段」**必然**是正在读的那段**之前**的段落。
+    // 而这里原来一律取"视口顶端那一段"当视图位置 —— 于是在朗读时，
+    // 记下来的视图位置**系统性地落后于朗读位置**。真机日志：
+    //   `位置[写回] spot=(1,2,1) 视图位置=(1,0,0) 朗读位置=(1,2,1)`
+    // （朗读在第 2 段，视图位置却记成第 0 段）。
+    //
+    // 修法：**朗读正在进行、且朗读位置就在当前页**时，视图位置直接取朗读位置。
+    // 这正是"用户此刻在看哪"的真实答案 —— 画面是跟随逻辑摆的，
+    // 它摆到哪，用户看的就是哪。
+    //
+    // 只在"同一页"时这样做：朗读已经跑到别的页（用户手动翻走了）时，
+    // 视图位置仍应按用户实际停留处记，否则会把用户翻到的位置写丢。
+    if (_tts.speaking &&
+        !_negativeDisableReadingSpot &&
+        !_pageTurning &&
+        !_inPageSettleWindow) {
+      final cursor = _tts.cursor;
+      final readingBlock = _paragraphBlockIndex(cursor.$1, cursor.$2);
+      final readingPage = _paging.isEmpty
+          ? -1
+          : _paging.pageIndexForParagraph(cursor.$1, cursor.$2);
+      if (readingPage == _displayedPage && readingBlock >= 0) {
+        // 量得到锚点才认（段落还没建出来时不写，避免记下一个"没显示过"的位置）
+        final ctx = _anchors[readingBlock]?.currentContext;
+        if (ctx != null && ctx.mounted) {
+          final box = ctx.findRenderObject();
+          if (box is RenderBox && box.hasSize) {
+            _lastSpot = (cursor.$1, cursor.$2, cursor.$3);
+            _followLog(
+              '视图位置',
+              '朗读中 → 取朗读位置 (${cursor.$1},${cursor.$2},${cursor.$3})',
+            );
+            return;
+          }
+        }
+      }
+    }
 
     // 只认「属于当前页」的段落。
     //
@@ -2942,6 +3151,45 @@ class _ReaderPageState extends State<ReaderPage> {
 
   // ---------------- 定位与跟随滚动 ----------------
 
+  // ── 朗读跟随观测（v1.21.53 排查用）──────────────────────────────────
+  //
+  // ⚠️ 这一批**只观测、不改判据**（交接文档第三节的规矩：先加观测再改代码）。
+  // 一条链原本几乎没有日志，于是「该居中却没居中」到底断在
+  // ①没收到游标 ②收到但被闸门挡住 ③量不到几何 ④滚了但目标算错
+  // ⑤滚动被下一句打断，完全无从判断。加完之后按日志一次定位。
+  //
+  // 前缀统一 `朗读跟随[...]`，整条链按它筛：
+  //   游标 → 决策 → 几何 → 跟随 → 滚动/跳过 → 定位链 → 进入页面定位
+  void _followLog(String tag, String detail) {
+    CrashLog.mark('朗读跟随[$tag] $detail');
+  }
+
+  /// 跟随相关闸门的状态快照（统一口径，避免各调用点各写一份）
+  ///
+  /// 只读，不产生副作用 —— 观测期必须保证「打日志本身不会改变行为」。
+  String _followGates() {
+    final scroll = _pageScroll(_displayedPage);
+    final hasClients = scroll.hasClients;
+    final pixels = hasClients ? scroll.position.pixels : null;
+    return '页=$_displayedPage/落定=$_pageIndex '
+        '翻页中=$_pageTurning 落位窗=$_inPageSettleWindow '
+        '用户滚动=$_userScrolling 抑制=$_autoFollowSuppressed 自动跟随=$_pageAutoFollow '
+        '有客户端=$hasClients '
+        '偏移=${pixels == null ? "?" : pixels.toStringAsFixed(1)} '
+        '在跑目标=${_followScrollTarget?.toStringAsFixed(1) ?? "无"}';
+  }
+
+  /// 段落锚点是否已建出来 + 能不能量到尺寸（跟随失败的常见断点）
+  String _anchorProbe(int blockIndex) {
+    final context = _anchors[blockIndex]?.currentContext;
+    if (context == null) return '锚点=无';
+    if (!context.mounted) return '锚点=已卸载';
+    final box = context.findRenderObject();
+    if (box is! RenderBox) return '锚点=非RenderBox';
+    if (!box.hasSize) return '锚点=无尺寸';
+    return '锚点=有(${box.size.height.toStringAsFixed(1)}px)';
+  }
+
   // ---------------- 分页导航 ----------------
 
   /// 重建分页控制器（换文档 / 换「每页段数」都要重来）
@@ -2979,21 +3227,35 @@ class _ReaderPageState extends State<ReaderPage> {
   /// 滚动控制器。原来那套「估算滚动偏移 + 反复微调」在分页下没有意义
   /// （每一页的滚动范围都是独立的），也正好把「跳转时页面乱动」的老问题绕开了。
   Future<void> _revealBlock(int blockIndex, {double alignment = 0.05}) async {
-    if (_blocks.isEmpty || _paging.isEmpty || !mounted) return;
+    if (_blocks.isEmpty || _paging.isEmpty || !mounted) {
+      _followLog(
+        '定位放弃',
+        '块=$blockIndex 前提不满足（块数=${_blocks.length} 分页空=${_paging.isEmpty} mounted=$mounted）',
+      );
+      return;
+    }
     final target = blockIndex.clamp(0, _blocks.length - 1);
     final pageIndex = _pageOfBlock(target);
     _anchors.putIfAbsent(target, () => GlobalKey());
+    _followLog(
+      '定位开始',
+      '块=$target 页=$pageIndex 当前落定页=$_displayedPage ${_anchorProbe(target)} '
+      '对齐=$alignment ${_followGates()}',
+    );
 
     // 页还没到位：先翻过去，等 PageView 把这一页建出来
     if (pageIndex != _pageIndex) {
       _jumpToPage(pageIndex);
       final token = ++_jumpToken;
+      var waited = 0;
       for (var attempt = 0; attempt < 12; attempt++) {
         await WidgetsBinding.instance.endOfFrame;
         if (token != _jumpToken || !mounted) return;
         if (pageIndex == _pageIndex) break;
+        waited++;
       }
       if (token != _jumpToken) return;
+      _followLog('定位翻页', '目标页=$pageIndex 已到位（等 $waited 帧）');
     }
 
     // 页内对齐：本页的列表可能还在构建，给它几帧
@@ -3006,6 +3268,11 @@ class _ReaderPageState extends State<ReaderPage> {
           alignment: alignment,
         );
         _pruneAnchors(target);
+        _followLog(
+          '定位完成',
+          '块=$target 第${attempt + 1}次尝试 ensureVisible(瞬时) '
+          '落点=${_pageScroll(_displayedPage).hasClients ? _pageScroll(_displayedPage).position.pixels.toStringAsFixed(1) : "?"}',
+        );
         return;
       }
       await _nextFrame();
@@ -3022,6 +3289,7 @@ class _ReaderPageState extends State<ReaderPage> {
     // ⚠️ 这里**用瞬时跳转（jumpTo）而不是动画**：外推本身要迭代几轮，
     // 每轮都跑 200ms 动画的话整条定位要一秒多 —— 期间游标早就又往前走了，
     // 于是永远追不上（表现成「点了没反应 / 框乱跳」）。
+    _followLog('定位外推', '块=$target 锚点 6 帧未建出 → 进入外推（最多 10 轮）');
     for (var round = 0; round < 10; round++) {
       if (!mounted) return;
       if (_anchors[target]?.currentContext != null) break;
@@ -3039,11 +3307,20 @@ class _ReaderPageState extends State<ReaderPage> {
           alignment: alignment,
         );
         _pruneAnchors(target);
+        _followLog(
+          '定位完成',
+          '块=$target 第${attempt + 1}次尝试 ensureVisible（外推后）',
+        );
         return;
       }
       await _nextFrame();
       if (!mounted) return;
     }
+    _followLog(
+      '定位失败',
+      '★块=$target 外推 10 轮后锚点仍未建出 ${_anchorProbe(target)} '
+      '偏移=${_pageScroll(_displayedPage).hasClients ? _pageScroll(_displayedPage).position.pixels.toStringAsFixed(1) : "无客户端"}',
+    );
   }
 
   /// 等下一帧结束
@@ -3133,6 +3410,7 @@ class _ReaderPageState extends State<ReaderPage> {
 
   /// 朗读推进时跟随：PDF 原版式跟页，分页版面按「读完本页才翻」翻页
   void _followCursor((int, int, int) cursor) {
+    _followLog('决策', '章=${cursor.$1} 段=${cursor.$2} 句=${cursor.$3} ${_followGates()}');
     if (_isPdf && !_pdfTextView) {
       final page = cursor.$1 + 1;
 
@@ -3170,7 +3448,10 @@ class _ReaderPageState extends State<ReaderPage> {
     final target = _paging.pageIndexForParagraph(cursor.$1, cursor.$2);
     if (target != _pageIndex) {
       // 用户自己翻到别处看了：这一轮不自动跟（想跟回来按「回到朗读页」）
-      if (!_pageAutoFollow) return;
+      if (!_pageAutoFollow) {
+        _followLog('跳过', '目标页=$target≠当前页=$_pageIndex 且 自动跟随=false（用户翻到别处）');
+        return;
+      }
 
       // 自动翻页**只在读完本页最后一句时**才发生。
       //
@@ -3185,14 +3466,25 @@ class _ReaderPageState extends State<ReaderPage> {
       final current = _paging.pageAt(_displayedPage);
       final readingForward = cursor.$1 > current.chapter ||
           (cursor.$1 == current.chapter && cursor.$2 >= current.paragraphEnd);
-      if (!readingForward) return;
-      if (!_cursorFinishedPage(cursor, _displayedPage)) return;
+      if (!readingForward) {
+        _followLog('跳过', '目标页=$target≠当前页=$_pageIndex 但未向前读（段=${cursor.$2} '
+            '本章段范围=${current.paragraphStart}~${current.paragraphEnd}）');
+        return;
+      }
+      if (!_cursorFinishedPage(cursor, _displayedPage)) {
+        _followLog('跳过', '目标页=$target≠当前页=$_pageIndex 但本页未读完');
+        return;
+      }
 
       // **同一目标页只自动翻一次**：朗读推进很快时这里会被反复调用，
       // 只靠翻页闸门不够（闸门一放开就会对同一个目标再翻一次）。
       final last = _lastAutoTurnTarget;
-      if (last != null && target <= last) return;
+      if (last != null && target <= last) {
+        _followLog('跳过', '目标页=$target 已被同一目标去过（last=$last）');
+        return;
+      }
       _lastAutoTurnTarget = target;
+      _followLog('翻页', '自动翻页 → 目标页=$target（本页=$_displayedPage）');
       _turnPageTo(target);
       return;
     }
@@ -3224,9 +3516,18 @@ class _ReaderPageState extends State<ReaderPage> {
     // 这里只做「框掉到下方就往下跟」这一件事；「框跑到上方 / 贴到顶部」由
     // `_ensureSentenceVisible` 统一处置（它会强制翻页而不是上滚）——
     // 两个回调各滚各的，正是「框上下乱跳 + 快速向后翻页」的根源。
-    if (_userScrolling) return; // 用户正在浏览，不抢滚动
-    if (_autoFollowSuppressed) return; // 刚点过句子：这一轮以点击为准
-    if (_pageTurning || _inPageSettleWindow) return;
+    if (_userScrolling) {
+      _followLog('跳过', '用户正在滚动');
+      return;
+    }
+    if (_autoFollowSuppressed) {
+      _followLog('跳过', '刚点过句子的抑制窗口内');
+      return;
+    }
+    if (_pageTurning || _inPageSettleWindow) {
+      _followLog('跳过', '翻页中或落位窗口内（翻页中=$_pageTurning 落位窗=$_inPageSettleWindow）');
+      return;
+    }
     final geometry = _readingGeometry();
     if (geometry == null) {
       // 量不到几何（段落还没渲染 / 视口没就绪）：它可能离得很远 ——
@@ -3234,11 +3535,25 @@ class _ReaderPageState extends State<ReaderPage> {
       // 于是「句子锚点」根本没建出来。这时用段落锚点兜底把它拉进来，
       // 拉进来之后后续就是正常的按句跟随。
       final block = _paragraphBlockIndex(cursor.$1, cursor.$2);
-      if (!_paragraphVisible(block)) _scheduleReveal(block);
+      final visible = _paragraphVisible(block);
+      _followLog(
+        '几何失败',
+        '块=$block ${_anchorProbe(block)} 段落可见=$visible '
+        '→ ${visible ? "不兜底（已可见，等下一句再试）" : "走段落兜底定位"}',
+      );
+      if (!visible) _scheduleReveal(block);
       return;
     }
+    _followLog(
+      '几何',
+      '句顶=${geometry.sentenceTop.toStringAsFixed(1)} 视口高=${geometry.height.toStringAsFixed(1)} '
+      '上界=${(geometry.height * _visibleUpperBound).toStringAsFixed(1)} '
+      '下界=${(geometry.height * _visibleLowerBound).toStringAsFixed(1)} '
+      '占位=${(geometry.sentenceTop / geometry.height * 100).toStringAsFixed(0)}%',
+    );
     if (geometry.sentenceTop <= geometry.height * _visibleUpperBound) {
       // 还在舒服区内 / 已经在上方：不向下滚。上方的情况交给 `_ensureSentenceVisible`
+      _followLog('不滚', '句顶在 72% 线以上（舒服区 / 已在上方）→ 交给 _ensureSentenceVisible');
       _ensureSentenceVisible();
       return;
     }
@@ -3247,6 +3562,7 @@ class _ReaderPageState extends State<ReaderPage> {
     final spans = _sentenceSpans[key];
     final span = spans?.where((item) => item.$1 == cursor.$3).toList();
     if (span == null || span.isEmpty) {
+      _followLog('跳过', '占位=$key 句号=${cursor.$3} 的字符区间还没上报（已缓存段=${_sentenceSpans.length}）');
       _ensureSentenceVisible();
       return;
     }
@@ -3300,6 +3616,78 @@ class _ReaderPageState extends State<ReaderPage> {
     return delta + size > 0 && delta < height;
   }
 
+  /// **实测**某一段里第 [sentence] 句的纵向区间（相对该段文字块顶部），量不到返回 null
+  ///
+  /// ## 为什么要实测（v1.21.53 修「不居中 / 位置不对」的根因）
+  ///
+  /// 原来用 `显式换行数 × 行高` 估算句内偏移，**只数 `\n`**。而中文字幕段落
+  /// 几乎全是**软换行**（一个 `\n` 都没有）——实测日志：
+  /// `朗读跟随[跟随] 块=8 段顶=452.0 显式换行=0 行高=28.9 句内偏移=0.0`。
+  /// 于是**段内每一句的「句顶」恒等于「段顶」**：
+  /// - 「舒服区」判据比的是**段顶**，段中间/段尾的句子永远不会被判成「太靠下」
+  ///   → 该滚的时候不滚；
+  /// - 真要滚时把**段顶**对齐到 38%，而被读的那句在段内很深（段常比视口高好几倍）
+  ///   → 句字落在屏幕外或明显偏心。
+  ///
+  /// 与 PDF 的对照：`features/pdf_reading/sentence_centering.dart` 的
+  /// `targetOffset` 两个输入都是**实测值**（`getOffsetToReveal` 的页顶偏移 +
+  /// 句的 `bounds.center.dy`）——PDF 稳就稳在"不猜"。这里用
+  /// `RenderParagraph.getBoxesForSelection` 把同一件事在 EPUB 上做实：
+  /// 每个句子本来就是独立的 `TextSpan`（见 `_ParagraphViewState._span`），
+  /// 字符区间由 `_onSentenceSpans` 上报，所以能精确定位到**那一句**的盒子。
+  ///
+  /// 返回 `(top, bottom)`：句首行的上沿与末行的下沿（相对文字块顶部）。
+  ({double top, double bottom})? _measureSentenceInParagraph(
+    int blockIndex,
+    int chapter,
+    int paragraphIndex,
+    int sentence,
+  ) {
+    final box = _anchors[blockIndex]?.currentContext?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    // ★负向自检开关：置 true 等于退回"只用估算"的旧行为（软换行 bug 复现）
+    if (_negativeDisableMeasure) return null;
+    // 段落视图结构：Padding > GestureDetector > DecoratedBox > Padding > Text.rich
+    // 最内层的 RenderParagraph 才是排版结果；直接按类型向下找，别写死层数。
+    final paragraphRender = _findRenderParagraph(box);
+    if (paragraphRender == null) return null;
+    final spans = _sentenceSpans['$chapter:$paragraphIndex'];
+    if (spans == null) return null;
+    final hit = spans.where((item) => item.$1 == sentence).toList();
+    if (hit.isEmpty) return null;
+    final start = hit.first.$2;
+    final end = hit.first.$3;
+    if (end <= start) return null;
+    final boxes = paragraphRender.getBoxesForSelection(
+      TextSelection(baseOffset: start, extentOffset: end),
+    );
+    if (boxes.isEmpty) return null;
+    var top = double.infinity;
+    var bottom = -double.infinity;
+    for (final b in boxes) {
+      if (b.top < top) top = b.top;
+      if (b.bottom > bottom) bottom = b.bottom;
+    }
+    if (!top.isFinite || !bottom.isFinite || bottom <= top) return null;
+    return (top: top, bottom: bottom);
+  }
+
+  /// 在渲染子树里找最内层的 [RenderParagraph]（段落文字的真实排版盒）
+  RenderParagraph? _findRenderParagraph(RenderObject root) {
+    RenderParagraph? found;
+    void visit(RenderObject node) {
+      if (found != null) return;
+      if (node is RenderParagraph) {
+        found = node;
+        return;
+      }
+      node.visitChildren(visit);
+    }
+
+    visit(root);
+    return found;
+  }
+
   /// 正在朗读的那一段、那一句相对本页视口的位置
   ///
   /// 这是整套「跟随」的唯一判据来源 —— 位置分档之后各走各的处置，
@@ -3309,6 +3697,19 @@ class _ReaderPageState extends State<ReaderPage> {
       _readingGeometry() {
     final cursor = _tts.highlightCursor;
     if (cursor == null) return null;
+    return _geometryForCursor(cursor);
+  }
+
+  /// 与 [_readingGeometry] 同一套算术，但**显式指定游标**
+  ///
+  /// 为什么必须分开：`_tts.highlightCursor` **只在朗读进行中**才非空
+  /// （见 `TtsManager.highlightCursor`：`_speaking && !_oneShot`）。
+  /// 而「重回阅读页」恰恰是**没有在朗读**的场景（用户退出去了、或读完了），
+  /// 于是进入定位那条链永远拿不到几何 → 一句校验都做不了
+  /// （真机日志表现：`[进入定位结束] 轮次用尽` 而 `[进入定位校验]` 一条都没有）。
+  /// 进入定位要量的是「请求恢复的那个 spot」，所以游标由调用方给。
+  ({double sentenceTop, double paragraphTop, double paragraphBottom, double height})?
+      _geometryForCursor((int, int, int) cursor) {
     final scroll = _pageScroll(_displayedPage);
     if (!scroll.hasClients) return null;
     final position = scroll.position;
@@ -3320,23 +3721,49 @@ class _ReaderPageState extends State<ReaderPage> {
     if (paragraphTop == null) return null;
     final box = _anchors[block]?.currentContext?.findRenderObject();
     final size = box is RenderBox && box.hasSize ? box.size.height : 0.0;
-    // 句子的纵向偏移：用「本段行高 × 该句之前的换行数」估算
-    // （精确值要 TextPainter 重新排版，代价高且没必要 —— 这里只用来分档）
-    var sentenceTop = paragraphTop;
+    // 句子的纵向位置：**优先实测**（见 `_measureSentenceInParagraph`），
+    // 量不到才退回「显式换行数 × 行高」的估算。
+    //
+    // ⚠️ 实测路径与估算路径必须都保留：段落文字块还没排版出来时
+    // （`getBoxesForSelection` 拿不到盒子）仍然要能分档，否则跟随会整条失效。
+    //
+    // 口径统一为**句心**（不是句顶）：与 `_followSentence` 的滚动目标、
+    // 以及 PDF 的 `bounds.center.dy` 完全一致，避免"判据看句心、滚动按句顶"。
+    var sentenceCenter = paragraphTop + size / 2;
     final key = '${cursor.$1}:${cursor.$2}';
     final spans = _sentenceSpans[key];
     final span = spans?.where((item) => item.$1 == cursor.$3).toList();
-    if (span != null && span.isNotEmpty) {
+    final measured = _measureSentenceInParagraph(
+      block,
+      cursor.$1,
+      cursor.$2,
+      cursor.$3,
+    );
+    if (measured != null) {
+      // 段落文字块顶部相对段落锚点还有一段内边距（`_ParagraphView` 的
+      // `EdgeInsets.symmetric(horizontal: 10, vertical: 8)`），必须补上，
+      // 否则实测值会系统性偏上 8px。
+      sentenceCenter = paragraphTop +
+          _paragraphTextInsetTop +
+          (measured.top + measured.bottom) / 2;
+      _lastSentenceMeasure = '实测(顶=${measured.top.toStringAsFixed(1)} '
+          '底=${measured.bottom.toStringAsFixed(1)})';
+    } else if (span != null && span.isNotEmpty) {
       final paragraph = _doc?.chapters[cursor.$1].paragraphs[cursor.$2];
       if (paragraph != null) {
         final start = span.first.$2.clamp(0, paragraph.text.length);
         final breaks =
             '\n'.allMatches(paragraph.text.substring(0, start)).length;
-        sentenceTop += breaks * _style.fontSize * _style.lineHeight;
+        final lineHeight = _style.fontSize * _style.lineHeight;
+        // 估算只能给出"该句起始行"的位置，取该行**中线**当作句心近似
+        sentenceCenter += breaks * lineHeight + lineHeight / 2;
+        _lastSentenceMeasure = '估算(显式换行=$breaks)';
       }
+    } else {
+      _lastSentenceMeasure = '无(无字符区间,退化为段心)';
     }
     return (
-      sentenceTop: sentenceTop - position.pixels,
+      sentenceTop: sentenceCenter - position.pixels,
       paragraphTop: paragraphTop - position.pixels,
       paragraphBottom: paragraphTop + size - position.pixels,
       height: height,
@@ -3442,6 +3869,7 @@ class _ReaderPageState extends State<ReaderPage> {
   void _scheduleReveal(int block) {
     // 记下最新目标：正在跑的那条链会接过去
     _revealWantBlock = block;
+    _followLog('定位安排', '块=$block 已在跑=$_revealBusy 上次=<$_revealScheduledAt>');
     if (_revealBusy) return;
     // 节流：两条链之间留一点间隔，避免刚落地又立刻重开
     final scheduled = _revealScheduledAt;
@@ -3500,11 +3928,20 @@ class _ReaderPageState extends State<ReaderPage> {
         // （实测：`wantBlock` 一直挂着旧值 1，而游标早跑到 5 了）。
         // 改成「成功且没有新目标时才清」，失败时原值留给重试。
         final cursor = _tts.highlightCursor;
-        if (cursor == null) return;
+        if (cursor == null) {
+          _followLog('定位链', '游标为空 → 收工');
+          return;
+        }
         final live = _paragraphBlockIndex(cursor.$1, cursor.$2);
         await _revealBlock(live, alignment: 0.35);
         if (!mounted) return;
-        if (_paragraphComfortable(live)) {
+        final ok = _paragraphComfortable(live);
+        _followLog(
+          '定位链',
+          '块=$live 结果=${ok ? "已舒适落位" : "★未落位（将重试）"} stall=$stall '
+          '想要=$_revealWantBlock ${_anchorProbe(live)}',
+        );
+        if (ok) {
           stall = 0;
           // 落好了：期间没有新目标才算真的收工
           if (_revealWantBlock == want) {
@@ -3766,6 +4203,30 @@ class _ReaderPageState extends State<ReaderPage> {
   ///   这样它要再往下走 34% 的视口高度才会触发下一次滚动，
   ///   连续快进时会「攒几句再滚一次」，而不是每句都蹭一下。
 
+  /// 段落文字块相对段落锚点的**上内边距**
+  ///
+  /// `_ParagraphView` 的结构是 `Padding(vertical: paragraphSpacing/2)` →
+  /// 手势/装饰 → `Padding(horizontal: 10, vertical: 8)` → `Text.rich`。
+  /// 实测句子盒子时量到的是**文字块内部**的 y，而段落锚点量的是**最外层**的
+  /// y，两者差着这段内边距。不补就会让句顶系统性偏上。
+  static const double _paragraphTextInsetTop = 8.0;
+
+  /// 最近一次句顶用的是实测还是估算（只用于观测日志）
+  String _lastSentenceMeasure = '?';
+
+  /// ★负向自检专用开关（**必须保持 false**）
+  ///
+  /// 置 true 会让 [RenderParagraph] 实测失效、退回"显式换行数 × 行高"的旧估算，
+  /// 用来验证「软换行」那两条用例真的在守这条线（实测：置 true 后两条都变红）。
+  /// 生产代码永远不该动它 —— 它存在的唯一目的是让负向自检可复现。
+  static const bool _negativeDisableMeasure = false;
+
+  /// ★负向自检专用开关（**必须保持 false**）
+  ///
+  /// 置 true 会让「朗读中记视图位置」退回原来的"取视口最顶端那一段"，
+  /// 用来验证「重回阅读页」那条用例真的在守这条线。
+  static const bool _negativeDisableReadingSpot = false;
+
   /// 段落（锚点）在**所属滚动列表**里的绝对偏移；量不到返回 null
   ///
   /// 为什么不用 `RenderAbstractViewport.getOffsetToReveal`：分页版面是
@@ -3789,24 +4250,56 @@ class _ReaderPageState extends State<ReaderPage> {
     // 只滚**当前页**的控制器：翻页动画由 PageView 负责，
     // 拿别页的控制器去滚会互相打架（也是「页面乱动」的一个来源）。
     final scroll = _pageScroll(_displayedPage);
-    if (!scroll.hasClients) return;
+    if (!scroll.hasClients) {
+      _followLog('跟随跳过', '页=$_displayedPage 的控制器没有客户端');
+      return;
+    }
     final block = _paragraphBlockIndex(cursor.$1, cursor.$2);
     final paragraphTop = _paragraphScrollOffset(block, scroll.position);
-    if (paragraphTop == null) return;
+    if (paragraphTop == null) {
+      _followLog('跟随跳过', '块=$block ${_anchorProbe(block)} 量不到段落偏移');
+      return;
+    }
 
     final style = _style;
     final lineHeight = style.fontSize * style.lineHeight;
     final paragraph = _doc?.chapters[cursor.$1].paragraphs[cursor.$2];
-    if (paragraph == null) return;
-    final start = span.$2.clamp(0, paragraph.text.length);
-    final before = paragraph.text.substring(0, start);
-    final explicitBreaks = '\n'.allMatches(before).length;
-    final sentenceOffset = explicitBreaks * lineHeight;
+    if (paragraph == null) {
+      _followLog('跟随跳过', '取不到段落文本 章=${cursor.$1} 段=${cursor.$2}');
+      return;
+    }
+
+    // 句内纵向位置：**优先实测**（与 `_readingGeometry` 同一来源，
+    // 保证「判据」与「滚动目标」用的是同一个数，不会一个实测一个估算而互相打架）。
+    // 量不到才退回「显式换行数 × 行高」的估算 —— 中文字幕段落几乎全是软换行，
+    // 估算恒为 0，这正是原来「句顶恒等于段顶」的根因（详见 `_measureSentenceInParagraph`）。
+    final measured = _measureSentenceInParagraph(
+      block,
+      cursor.$1,
+      cursor.$2,
+      cursor.$3,
+    );
+    final double sentenceInset;
+    if (measured != null) {
+      // 句心相对段落文字块顶部；用「句心」而不是「句顶」对齐，
+      // 与 PDF 的 `sentenceCenterY`（`bounds.center.dy`）口径一致 ——
+      // 句顶对齐会让长短句的视觉重心忽上忽下。
+      // 补上文字块的上内边距后，`paragraphTop + sentenceInset` 即绝对句心。
+      sentenceInset =
+          _paragraphTextInsetTop + (measured.top + measured.bottom) / 2;
+    } else {
+      final start = span.$2.clamp(0, paragraph.text.length);
+      final before = paragraph.text.substring(0, start);
+      final explicitBreaks = '\n'.allMatches(before).length;
+      sentenceInset = explicitBreaks * lineHeight;
+    }
 
     final scrollPosition = scroll.position;
-    final sentenceTop = paragraphTop + sentenceOffset - scrollPosition.pixels;
+    // 句心相对视口顶的偏移
+    final sentenceInsetAbs = paragraphTop + sentenceInset;
+    final sentenceCenter = sentenceInsetAbs - scrollPosition.pixels;
     final viewportHeight = scrollPosition.viewportDimension;
-    // 舒适区：视口 8% ~ 72%
+    // 舒适区：句心落在视口 8% ~ 72% 之间就不动
     //
     // 区间的选择直接决定「快进时会不会一直滑」：
     // - 判定用 72%（而不是更小的值）：句子要走到屏幕下方 3/4 处才滚，
@@ -3816,15 +4309,37 @@ class _ReaderPageState extends State<ReaderPage> {
     // 这两条合起来就是「不每句都滚」的原因。
     final topLimit = viewportHeight * 0.08;
     final bottomLimit = viewportHeight * 0.72;
-    if (sentenceTop >= topLimit && sentenceTop <= bottomLimit) return;
+    _followLog(
+      '跟随',
+      '块=$block 段顶=${paragraphTop.toStringAsFixed(1)} 句位=$_lastSentenceMeasure '
+      '句内偏移=${sentenceInset.toStringAsFixed(1)} '
+      '句心=${sentenceCenter.toStringAsFixed(1)} 视口高=${viewportHeight.toStringAsFixed(0)} '
+      '区间=[${topLimit.toStringAsFixed(0)},${bottomLimit.toStringAsFixed(0)}] '
+      '偏移=${scrollPosition.pixels.toStringAsFixed(1)} max=${scrollPosition.maxScrollExtent.toStringAsFixed(1)}',
+    );
+    if (sentenceCenter >= topLimit && sentenceCenter <= bottomLimit) {
+      _followLog('不滚', '句心=${sentenceCenter.toStringAsFixed(1)} 落在舒适区内');
+      return;
+    }
 
-    // 本页最后一句不再往上滚（它已经在屏幕里之后就不需要动），
-    // 否则页尾会把内容顶出视野
-    final want = (scrollPosition.pixels + sentenceTop - viewportHeight * 0.38)
+    // 目标：把**句心**放到视口 38% 处（与 PDF 的 alignment 口径一致）。
+    // 原来是把「段顶」放到 38%，段比视口高时被读的那句会落到屏幕外。
+    final want = (scrollPosition.pixels + sentenceCenter - viewportHeight * 0.38)
         .clamp(0.0, scrollPosition.maxScrollExtent);
-    if ((want - scrollPosition.pixels).abs() < 2) return;
-    if (_alreadyScrollingTo(want)) return;
+    if ((want - scrollPosition.pixels).abs() < 2) {
+      _followLog('不滚', '目标=${want.toStringAsFixed(1)} 与当前偏移之差<2px');
+      return;
+    }
+    if (_alreadyScrollingTo(want)) {
+      _followLog('不滚', '已有一次滚向 ${want.toStringAsFixed(1)} 的动画在跑（防无限重启）');
+      return;
+    }
 
+    _followLog(
+      '滚动',
+      '目标=${want.toStringAsFixed(1)} 起点=${scrollPosition.pixels.toStringAsFixed(1)} '
+      '位移=${(want - scrollPosition.pixels).toStringAsFixed(1)} 对齐=句心38% 动画=200ms',
+    );
     _startFollowScroll(scroll, want);
   }
 
@@ -3847,7 +4362,11 @@ class _ReaderPageState extends State<ReaderPage> {
   void _startFollowScroll(ScrollController scroll, double target) {
     // 关键：先把正在跑的滚动动画停住。
     // `jumpTo(当前像素)` = 取消动画但不移动，否则两次 animateTo 会叠加、画面来回抖。
-    if (!scroll.hasClients) return;
+    if (!scroll.hasClients) {
+      _followLog('滚动跳过', 'animateTo 前控制器已无客户端');
+      return;
+    }
+    final from = scroll.position.pixels;
     scroll.position.jumpTo(scroll.position.pixels);
     _followScrollTarget = target;
     _followScrollTimer?.cancel();
@@ -3855,6 +4374,8 @@ class _ReaderPageState extends State<ReaderPage> {
     _followScrollTimer = Timer(const Duration(milliseconds: 260), () {
       _followScrollTarget = null;
     });
+    // 观测③：用的就是 animateTo；把「起点 / 目标 / 是否打断了上一次」记下来。
+    final interrupted = from != scroll.position.pixels;
     unawaited(
       scroll
           .animateTo(
@@ -3862,9 +4383,25 @@ class _ReaderPageState extends State<ReaderPage> {
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOutCubic,
           )
+          .then((_) {
+        // 动画正常收尾：回报实际落点（判断"有没有滚到位"）
+        if (!mounted || !scroll.hasClients) return;
+        final landed = scroll.position.pixels;
+        _followLog(
+          '滚动完成',
+          '目标=${target.toStringAsFixed(1)} 落点=${landed.toStringAsFixed(1)} '
+          '误差=${(landed - target).abs().toStringAsFixed(1)}px '
+          '${(landed - target).abs() < 1.5 ? "已到位" : "★未到位（被后续滚动接管或撞界）"}',
+        );
+      })
           .catchError((Object _) {
         // 被新的跟随滚动打断是正常的，不是错误
       }),
+    );
+    _followLog(
+      '滚动发起',
+      'API=animateTo 起点=${from.toStringAsFixed(1)} 目标=${target.toStringAsFixed(1)} '
+      '打断上一次=$interrupted',
     );
   }
 
