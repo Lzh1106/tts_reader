@@ -90,7 +90,13 @@ function listFiles(root) {
     /(^|\/)build\//,
     /(^|\/)local\.properties$/,
     /(^|\/)key\.properties$/,
-    /gradle-wrapper\.jar$/,
+    // ⚠️ **不要**排除 gradle-wrapper.jar（2026-10-16 踩过）：
+    // 发布树 .gitignore 里虽然有 `android/**/gradle-wrapper.jar`，但那个 .gitignore
+    // **管不到这里** —— 本脚本是按"远端已有文件 − 本次发布树文件"来算删除的，
+    // 一旦这里把它 skip 掉，就会把远端**已有的** wrapper jar 当成"该删"而删掉。
+    // 实测后果：v1.21.53 第一次同步把 .gitignore 与 wrapper jar 一起删了，
+    // 而 v1.21.52 的远端**本来是有**这两个文件的（339 个文件）——
+    // 等于把"clone 下来能编"这一点破坏了。这与交接文档 6.3 是同一类事故。
     /\.jks$/,
     /\.keystore$/,
   ];
