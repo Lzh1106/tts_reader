@@ -823,6 +823,7 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
     _speaking = false;
     _paused = false;
     _error = null;
+    _speakTimeouts = 0; // 单例跨用例不能留「引擎不回应」的记账
   }
 
   /// 当前朗读位置描述（通知栏副标题）
@@ -1795,6 +1796,31 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
     initTimeout = defaultInitTimeout;
     voiceTimeout = defaultVoiceTimeout;
     controlTimeout = defaultControlTimeout;
+    _speakTimeouts = 0;
+  }
+
+  /// 连续「单句朗读超时」的次数（引擎健康度）。见 [_onSpeakTimeout]。
+  ///
+  /// 只在**真的超时**时 +1，任何一次朗读成功就清零。
+  int _speakTimeouts = 0;
+
+  /// 只给测试看：当前连续超时了几次
+  @visibleForTesting
+  int get speakTimeoutStreak => _speakTimeouts;
+
+  /// 引擎已经被判「不回应」之后，重试单句最多等 `speakTimeout / 3`。
+  ///
+  /// 原来第一次超时后什么都不变 —— 用户再按一次播放会**原样再卡满 30 秒**，
+  /// 真机表现就是「同一位置连续两次卡死，每次 30 秒」。
+  ///
+  /// 取 1/3 而不是固定值：生产值 30 秒 → 10 秒（够一句正常长句读完，不会再误判），
+  /// 而测试里把 [speakTimeout] 调小后上限跟着变小，用例才跑得动。
+  /// 下限 [minRetrySpeakTimeout] 只防「0 秒」这种退化值。
+  static const Duration minRetrySpeakTimeout = Duration(milliseconds: 300);
+
+  Duration get _retrySpeakTimeout {
+    final Duration scaled = speakTimeout * 0.33;
+    return scaled > minRetrySpeakTimeout ? scaled : minRetrySpeakTimeout;
   }
 
   // ---------------- 插件调用串行锁 ----------------
@@ -2008,16 +2034,19 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
 
   /// 朗读一个片段：插件不回复时按超时失败处理；被新的朗读打断时安静退出
   Future<void> _speakChunk(TtsEngine engine, String chunk, int token) async {
+    // 已经被判过「不回应」的引擎，重试时不再原样等满 speakTimeout：
+    // 用户按一次卡 30 秒、再按一次又卡 30 秒，是这条链上最刺眼的症状。
+    final Duration budget = _speakTimeouts > 0 ? _retrySpeakTimeout : speakTimeout;
     final ok = await _awt(
       () async {
         try {
-          await _bounded(engine.speak(chunk), speakTimeout);
+          await _bounded(engine.speak(chunk), budget);
         } on TimeoutException {
-          CrashLog.mark('朗读失败：${engine.displayName} 超时（${speakTimeout.inMilliseconds}ms）');
-          throw StateError('${engine.displayName} 朗读超时（${speakTimeout.inSeconds} 秒无响应）');
+          CrashLog.mark('朗读失败：${engine.displayName} 超时（${budget.inMilliseconds}ms）');
+          rethrow;
         }
       },
-      speakTimeout,
+      budget,
       lock: 'speak',
       token: token,
     );
@@ -2027,11 +2056,63 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
       ok: ok,
       cursorAfter: _diagCursorKey(),
     );
-    if (ok) return;
+    if (ok) {
+      _speakTimeouts = 0; // 引擎恢复回应：下次照常等 speakTimeout
+      return;
+    }
     // 没排上队 / 被取消：令牌失效说明是旧循环，交给上层的令牌检查收尾；
     // 令牌仍然有效却失败，说明确实超时且没有抛出（例如等待被取消）
     if (token != _generation) throw const _WaitCancelled();
-    throw StateError('${engine.displayName} 朗读超时（${speakTimeout.inSeconds} 秒无响应）');
+    _onSpeakTimeout(engine);
+    throw StateError('${engine.displayName} 朗读超时（${budget.inSeconds} 秒无响应）');
+  }
+
+  /// 单句朗读超时 = 插件已经不回应了，**必须当成「引擎坏了」处理**。
+  ///
+  /// 真机（2026-10-17）：「本地 TTS · multitts 朗读超时（30000ms）」之后，
+  /// 同一位置再按播放**又卡满 30 秒**。
+  ///
+  /// 原因是 [_fail] 只清播放状态，而 [_ensureReady] 的就绪记账
+  /// （[_initedEngineId] / [_appliedSetupKey]）没变 —— 下一次直接**跳过
+  /// initialize**，把同一句又压给同一个卡死的 `FlutterTts` 实例；
+  /// 它 `speaking` / `speakResult` 还挂着，完成回调永远不会再来。
+  void _onSpeakTimeout(TtsEngine engine) {
+    _speakTimeouts++;
+    CrashLog.mark('引擎无响应：${engine.displayName}（连续第 $_speakTimeouts 次）'
+        '→ 作废就绪记账并清系统队列');
+    // ① 作废就绪记账：下一次必须重新 initialize，不能对着可能已死的插件直接 speak
+    if (_initedEngineId == engine.id) _initedEngineId = '';
+    _appliedSetupKey = '';
+    // ② 清系统侧队列：不 stop 的话上一句的 speakResult 会把下一句整个吞掉。
+    //    **不 await**：这个 stop 本身也可能卡住，等它等于把下一次朗读一起挡死。
+    unawaited(_awt(() => engine.stop(), controlTimeout, lock: 'recover-${engine.id}'));
+    // ③ 连续第二次仍不回应 → 这个实例不可信，强制重绑本地 TTS 引擎
+    if (_speakTimeouts >= 2 && engine is SystemTtsEngine) {
+      unawaited(_rebindSystemEngine(engine));
+    }
+    _notify();
+  }
+
+  /// 连续超时后强制重绑系统 TTS。
+  ///
+  /// Android 侧 `setEngineByPackageName` 会重建 `TextToSpeech` 实例，
+  /// 卡死的合成线程随之丢弃 —— 这是 Dart 层唯一能做的一次「真重置」。
+  /// 重绑也失败才换新对象（新对象至少把 Dart 侧的回调与等待全部作废）。
+  Future<void> _rebindSystemEngine(SystemTtsEngine engine) async {
+    final ok = await _awt(
+      () => engine.reset(),
+      initTimeout,
+      lock: 'reset-${engine.id}',
+    );
+    if (ok) {
+      CrashLog.mark('引擎重绑成功：${engine.displayName}');
+      return;
+    }
+    CrashLog.mark('引擎重绑失败：${engine.displayName} → 换新实例');
+    if (!identical(_engines[_systemId], engine)) return;
+    _register(SystemTtsEngine(enginePackage: _localEnginePackage));
+    unawaited(engine.dispose());
+    _notify();
   }
 
   /// 引擎准备：初始化 + 套用当前语速 / 音调 / 音色

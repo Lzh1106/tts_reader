@@ -29,6 +29,51 @@ import '../widgets/speech_diag_overlay.dart';
 import 'export_audio_page.dart';
 import 'toc_sheet.dart';
 
+/// 这条滚动通知是否代表「用户自己在操作」。
+///
+/// ★**`UserScrollNotification` 不等于「用户碰了屏幕」**：任何滚动**结束时**
+/// `goIdle()` 都会发一条 `direction == idle` 的它
+/// （`ScrollPositionWithSingleContext.beginActivity`：活动不再滚动就
+/// `updateUserScrollDirection(ScrollDirection.idle)`）。
+///
+/// 我们自己的跟随滚动用 `animateTo`（`DrivenScrollActivity`），一结束就发这一条。
+/// 原来不看 direction、一律当成「用户滚动」——于是**程序滚动把自己判成了人工操作**：
+/// `_userScrolling` 被置真 2.5 秒，期间 `_followCursor` / `_ensureSentenceVisible`
+/// 全部让位。真机表现就是「自动翻页之后视图与朗读脱节（`用户滚动=true`
+/// 而用户没碰屏幕）」。
+///
+/// 只有**方向不是 idle** 才是用户在拖；`ScrollUpdateNotification` 看 dragDetails。
+@visibleForTesting
+bool isUserScrollNotification(ScrollNotification notification) {
+  if (notification is UserScrollNotification) {
+    return notification.direction != ScrollDirection.idle;
+  }
+  if (notification is ScrollUpdateNotification) {
+    return notification.dragDetails != null;
+  }
+  return false;
+}
+
+/// 外推定位的**单轮位移上限**（像素）。
+///
+/// 目标段落很远时 `(target - reference) * perBlock` 会一次算出上万像素
+/// （真机 `43.4 → 11396`），`jumpTo` 直接把画面甩到别处，随后重试又跳回来
+/// —— 用户看到「先闪错、再跳回」。限成 [maxViewports] 个视口高，靠多轮迭代
+/// 逼近：每轮都落在附近，观感连续。
+@visibleForTesting
+double clampExtrapolateStep({
+  required double want,
+  required double from,
+  required double viewport,
+  double maxViewports = 3.0,
+}) {
+  final double maxStep = viewport * maxViewports;
+  if (maxStep <= 0) return want;
+  final double gap = want - from;
+  if (gap.abs() <= maxStep) return want;
+  return from + gap.sign * maxStep;
+}
+
 /// 正文块：章节标题栏或段落。扁平化成一条列表交给 ListView 惰性构建，
 /// 避免「一章几万段」时一次性构建全部 TextSpan 造成卡顿 / OOM。
 sealed class _Block {
@@ -2126,12 +2171,23 @@ class _ReaderPageState extends State<ReaderPage> {
             _syncBackToReading();
             // 用户滚到哪了：**趁活着的时候记下来**（dispose 时 ScrollPosition
             // 已经摘掉，量不到）。这是「退出重进回到同一位置」的数据来源。
+            // 每帧都会来一条，内部有节流（见 [_rememberVisibleSpot]）。
+            _rememberVisibleSpot();
+          } else if (notification is ScrollEndNotification) {
+            // 滚动停下来：再记一次落点（同值会被日志去重，不产生噪声）
             _rememberVisibleSpot();
           }
           // 用户自己在滚（不是跟随滚动）：暂停跟随，停止滚动 2.5 秒后恢复
-          final byUser = notification is UserScrollNotification ||
-              (notification is ScrollUpdateNotification &&
-                  notification.dragDetails != null);
+          //
+          // ⚠️ **`UserScrollNotification` 不等于「用户碰了屏幕」**：
+          // 任何滚动**结束时** `goIdle()` 都会发一条 `direction == idle` 的它
+          // （`ScrollPositionWithSingleContext.beginActivity` → 活动不滚动就
+          // `updateUserScrollDirection(idle)`）。我们自己的跟随 `animateTo`
+          // 一结束就发这一条，原来不看 direction 一律当成"用户滚动" ——
+          // 于是**程序滚动把自己判成了人工操作**：`_userScrolling` 被置真
+          // 2.5 秒，期间 `_followCursor` / `_ensureSentenceVisible` 全部让位。
+          // 真机表现：自动翻页后视图与朗读脱节（`用户滚动=true` 而用户没碰）。
+          final byUser = isUserScrollNotification(notification);
           if (byUser) {
             _markUserScrolling();
             // 用户要求：**滑动页面时不要误触朗读**。
@@ -2368,6 +2424,7 @@ class _ReaderPageState extends State<ReaderPage> {
       'comfortable': block >= 0 && _paragraphComfortable(block),
       'userScrolling': _userScrolling,
       'autoFollow': _pageAutoFollow,
+      'rememberSkipped': _rememberSpotSkipped,
       'suppressed': _autoFollowSuppressed,
       'pageTurning': _pageTurning,
       'settling': _inPageSettleWindow,
@@ -2622,6 +2679,21 @@ class _ReaderPageState extends State<ReaderPage> {
   /// `dispose()` 只做「用最后一次算好的值写盘」。
   /// 早先的做法是「退出前再量一次」，结果一直量不到、`_lastSpot` 停在 (0,0,0)，
   /// 表现就是「原格式下也有概率不能准确返回朗读位置」。
+  /// 上一次已经打过日志的视图位置（**同值不重复打**）
+  ///
+  /// 滚动动画每帧都会发 `ScrollUpdateNotification`，原来每帧都完整量一遍
+  /// 并且打一条 `朗读跟随[视图位置]` —— 真机实测 2 秒内上百条，把真机日志
+  /// 冲得没法看，也让「是不是用户滚动」的判断更难读。
+  ///
+  /// ⚠️ 这里**不能按墙钟时间节流**：widget 测试里所有帧都在几毫秒真实时间内
+  /// 跑完，按 `DateTime.now()` 节流会把最后那一次落点一起吞掉 ——
+  /// `reader_jump_test` 的「原格式退出在哪页」当场变红（实测）。
+  /// 所以改成**按值去重**：位置没变就不打日志，但 `_lastSpot` 每次都更新。
+  (int, int, int)? _lastLoggedSpot;
+
+  /// 被合并掉的日志条数（观测用，不参与任何判定）
+  int _rememberSpotSkipped = 0;
+
   void _rememberVisibleSpot() {
     final document = _doc;
     if (document == null || document.isEmpty) return;
@@ -2673,11 +2745,19 @@ class _ReaderPageState extends State<ReaderPage> {
         if (ctx != null && ctx.mounted) {
           final box = ctx.findRenderObject();
           if (box is RenderBox && box.hasSize) {
-            _lastSpot = (cursor.$1, cursor.$2, cursor.$3);
-            _followLog(
-              '视图位置',
-              '朗读中 → 取朗读位置 (${cursor.$1},${cursor.$2},${cursor.$3})',
-            );
+            final spot = (cursor.$1, cursor.$2, cursor.$3);
+            _lastSpot = spot;
+            // 同值不重复打日志：这里每帧都会被调用一次，值不变时打日志
+            // 只会把真机日志刷爆（真机实测 2 秒上百条）。
+            if (_lastLoggedSpot != spot) {
+              _lastLoggedSpot = spot;
+              _followLog(
+                '视图位置',
+                '朗读中 → 取朗读位置 (${cursor.$1},${cursor.$2},${cursor.$3})',
+              );
+            } else {
+              _rememberSpotSkipped++;
+            }
             return;
           }
         }
@@ -3390,8 +3470,22 @@ class _ReaderPageState extends State<ReaderPage> {
 
     final delta = (target - reference) * perBlock;
     final viewport = position.viewportDimension;
-    final want = (referenceTop + delta - viewport * alignment)
+    double want = (referenceTop + delta - viewport * alignment)
         .clamp(0.0, position.maxScrollExtent);
+    // ★单轮限幅（真机 `偏移 43.4 → 11396` 的来源）：
+    // 目标段落离得很远时（冷启动 / 跳读 / 锚点还没建出来），
+    // `(target - reference) * perBlock` 会一次算出上万像素，`jumpTo` 直接
+    // 把画面甩到别处，随后重试又跳回来 —— 用户看到的就是「先闪错再跳回」。
+    // 限成 3 个视口高，靠 `_revealBlock` 的多轮迭代逼近：每轮都落在附近，
+    // 观感是连续推进，且 6 轮内仍能走完 ~18 屏。
+    if (instant) {
+      want = clampExtrapolateStep(
+        want: want,
+        from: position.pixels,
+        viewport: viewport,
+        maxViewports: _maxExtrapolateViewports,
+      );
+    }
     if ((want - position.pixels).abs() < 2) return;
     // 外推定位用瞬时跳转（见 `_revealBlock` 里对 jumpTo 的说明）：
     // 每次迭代都快，几轮就能把目标段落带进可见范围。
@@ -3402,6 +3496,9 @@ class _ReaderPageState extends State<ReaderPage> {
     if (_alreadyScrollingTo(want)) return;
     _startFollowScroll(scroll, want);
   }
+
+  /// 外推单轮最多移动几个视口高（见 [_scrollTowardBlock] 的限幅说明）
+  static const double _maxExtrapolateViewports = 3.0;
 
   double? _blockHeight(int blockIndex) {
     final box = _anchors[blockIndex]?.currentContext?.findRenderObject();
@@ -3474,7 +3571,8 @@ class _ReaderPageState extends State<ReaderPage> {
           (cursor.$1 == current.chapter && cursor.$2 >= current.paragraphEnd);
       if (!readingForward) {
         _followLog('跳过', '目标页=$target≠当前页=$_pageIndex 但未向前读（段=${cursor.$2} '
-            '本章段范围=${current.paragraphStart}~${current.paragraphEnd}）');
+            '本页段范围=${current.paragraphStart}~${current.paragraphEnd} '
+            '当前页所在章=${current.chapter} 游标所在章=${cursor.$1}）');
         return;
       }
       if (!_cursorFinishedPage(cursor, _displayedPage)) {

@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -333,6 +333,46 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
 
   @override
   void setCompletionHandler(void Function()? handler) => _onComplete = handler;
+
+  /// 强制重绑系统 TTS（**真重置**）。
+  ///
+  /// 为什么需要：`speak()` 超时只说明「插件没回完成回调」，插件内部的
+  /// `speaking` / `speakResult` 仍然挂着。此时无论再 speak 多少次都只是
+  /// 把文本丢进一个不会回调的队列 —— 真机表现就是**同一位置重复卡满 30 秒**。
+  ///
+  /// `setEngine` 会让 Android 侧重走 `setEngineByPackageName`，重建
+  /// `TextToSpeech` 实例，卡死的合成线程随之丢弃。这是 Dart 层唯一能做到的
+  /// 「真重置」（新建 `FlutterTts()` 对象没用：原生插件是单例，状态还在）。
+  ///
+  /// 只在【连续两次 speak 都不回应】时由 `TtsManager` 调用，平时不要用。
+  Future<void> reset() async {
+    if (_disposed) throw StateError('引擎已释放');
+    _generation++; // 作废在飞的重投：重置之后不该再有旧文本被提交
+    _completePending();
+    _pending = null;
+    _fakeCompleteDrops = 0;
+    _speakIssuedAt = null;
+    _initialized = false;
+    try {
+      await _tts.stop(); // 先清系统侧队列与 speakResult
+    } catch (_) {
+      // 停不掉也要继续重绑
+    }
+    // 重绑需要一个**具体的包名**：空串交给 `setEngineByPackageName("")` 在
+    // 部分 ROM 上会直接 onInit 失败（引擎从此彻底没声）。用户没选过引擎时
+    // 先问一次系统默认包名，拿不到就跳过重绑（只做 stop + 重新 initialize）。
+    String target = _enginePackage;
+    if (target.isEmpty) {
+      try {
+        final dynamic def = await _tts.getDefaultEngine;
+        if (def is String) target = def.trim();
+      } catch (_) {
+        // 拿不到默认引擎名：跳过重绑
+      }
+    }
+    if (target.isNotEmpty) await _tts.setEngine(target);
+    await initialize(); // 重新注册完成 / 取消 / 出错回调
+  }
 
   @override
   Future<void> dispose() async {
