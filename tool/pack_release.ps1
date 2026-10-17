@@ -46,6 +46,8 @@ $PublishEntries = @(
   'pubspec.yaml',
   'pubspec.lock',
   'README.md',
+  'CHANGELOG.md',
+  'LICENSE',
   'lib',
   'android',
   'test',
@@ -57,10 +59,11 @@ $PublishEntries = @(
 # --- never copied, even inside the entries above --------------------------
 $ExcludeDirs = @('.dart_tool', 'build', 'dist', 'release', '.gradle', '.idea', '.vscode')
 $ExcludeFiles = @('*.iml', 'local.properties', '.flutter-plugins', '.flutter-plugins-dependencies',
-                  '*.jks', '*.keystore', '*.log',
-                  # Flutter injects the Gradle wrapper at build time, and .gitignore
-                  # ignores it - keep the bundle identical to what git would publish
-                  'gradle-wrapper.jar')
+                  '*.jks', '*.keystore', '*.log')
+# NOTE 2026-10-18: gradle-wrapper.jar was in this exclude list until it silently
+# deleted the file from the GitHub repo (the v1.21.53 incident, again). The jar is
+# tracked by git (`.gitignore` does not ignore it), so it MUST be published.
+# CHANGELOG.md / LICENSE had never been whitelisted and were deleted the same way.
 # docs\ is published for its images; every markdown file in it is an internal note
 $DropDocsMarkdown = $true
 
