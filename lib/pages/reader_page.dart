@@ -22,6 +22,7 @@ import '../services/document_service.dart';
 import '../services/paragraph_reflow.dart';
 import '../services/speech_diagnostics.dart';
 import '../services/storage_service.dart';
+import '../features/pdf_reading/pdf_read_session.dart';
 import '../tts/tts_manager.dart';
 import '../widgets/adaptive.dart';
 import '../widgets/speech_diag_overlay.dart';
@@ -367,6 +368,11 @@ class _ReaderPageState extends State<ReaderPage> {
     // 旧页会把**自己的**位置写到新书的进度上。
     // `hasDocument` 只对「管理器当前持有的那本书」放行，天然互斥。
     _tts.onBeforeDocumentSwitch = _persistProgressBeforeSwitch;
+    // ★v1.21.59：文字档阅读页进来了 → PDF 不再算"用户正在看的那本"。
+    //
+    // 这个标记只用于 `TtsAudioHandler.play()` 派发（见 `PdfReadSession.isForeground`）。
+    // 不清的话，从 PDF 页返回文字档后按耳机仍会被判成"在 PDF 页"，又读错书。
+    PdfReadSession.instance.setForeground(false);
     _buildPdfViewer();
     unawaited(_reloadBookmarks());
     _parse();

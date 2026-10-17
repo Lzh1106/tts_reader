@@ -183,8 +183,15 @@ class _ReadingControlBarState extends State<ReadingControlBar>
         playing: pdf.isPlaying,
         canResume: pdf.current != null,
         onPlayPause: () {
+          // ★v1.21.54 诊断：与 `TtsAudioHandler.play()` 那条对齐，一次记全。
+          // 用户报「切书后播放读回旧书」，两入口都要能一眼看出"这一下读了谁"。
           ReadingControlBar.diagnose(
-              '播放/暂停 → PDF ${pdf.isPlaying ? "pause" : "resume"}');
+              '播放/暂停 → PDF ${pdf.isPlaying ? "pause" : "resume"} '
+              'doc=${pdf.documentId} title=${pdf.documentTitle} '
+              'playing=${pdf.isPlaying} paused=${pdf.isPaused} '
+              'block=${pdf.positionLabel} '
+              'ttsDoc=${tts.activeDocumentId} ttsTitle=${tts.documentTitle} '
+              'ttsHasSession=${tts.hasSession}');
           if (pdf.isPlaying) {
             unawaited(pdf.pause());
           } else {
@@ -211,8 +218,14 @@ class _ReadingControlBarState extends State<ReadingControlBar>
       playing: tts.playing,
       canResume: true,
       onPlayPause: () {
+        // ★v1.21.54 诊断：同上，TTS 分支也要能一眼看出"这一下读了谁"。
         ReadingControlBar.diagnose(
-            '播放/暂停 → TTS ${tts.playing ? "pause" : "playFromCursor"}');
+            '播放/暂停 → TTS ${tts.playing ? "pause" : "playFromCursor"} '
+            'doc=${tts.activeDocumentId} title=${tts.documentTitle} '
+            'speaking=${tts.speaking} paused=${tts.paused} '
+            'cursor=${tts.cursor} '
+            'pdfDoc=${PdfReadSession.instance.documentId} '
+            'pdfPlayback=${PdfReadSession.instance.isPlaybackActive}');
         if (tts.playing) {
           unawaited(tts.pause());
         } else {

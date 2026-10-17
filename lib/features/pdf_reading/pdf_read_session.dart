@@ -7,6 +7,7 @@ import '../../services/crash_log.dart';
 import '../../services/speech_diagnostics.dart';
 import '../../services/storage_service.dart';
 import '../../tts/audio_session_source.dart';
+import '../../tts/media_interruption.dart';
 import '../../tts/tts_audio_handler.dart';
 import '../../tts/tts_manager.dart';
 import 'pdf_page_layer.dart';
@@ -592,6 +593,51 @@ class PdfReadSession extends ChangeNotifier implements AudioSessionSource {
       // 同一本书重进：**保留 _current**，这样「退出阅读页 → 再进来」能接着读。
       // 判据只用 id + 页数 —— 不要把 docRef 也算进去：测试里只给 layerLoader 时
       // docRef 是 null，算进去会让幂等判断失效（位置被清掉）。
+      //
+      // ⚠️ v1.21.55 回退过一次，v1.21.58 重新加回（条件更窄），原因见下。
+      //
+      // 用户反馈（2026-10-17）：
+      // > 「从上一本书，换到 pdf 时，用耳机控制启停控制的还是上一本书」
+      //
+      // 场景：EPUB 暂停着（有会话）→ 用户切到 PDF 阅读页（同一本，走本早返回）
+      // → `TtsAudioHandler` 的来源**仍是 tts-manager**（它还有会话，只是暂停）
+      // → 按耳机 → `playFromCursor()` 继续读 **EPUB**。
+      //
+      // 所以「用户打开这本 PDF 页」这一拍必须把来源收回来。
+      //
+      // ## 为什么这次不会重演 v1.21.55 的事故
+      //
+      // ⚠️ v1.21.59：**这里不再抢音频来源**（[_claimAudioFromTtsIfIdle] 已停用）。
+      //
+      // 前几版在这里（以及换书路径的末尾）抢来源，与新加的「按前台文档派发」
+      // 形成**两套并存机制**：一边靠改 source 表达"用户在看哪本"，
+      // 一边靠 `isForeground` 派发。两者会互相打架 ——
+      // 抢了来源，另一本文档会被 onStop 打断；不抢，又怕按播放派错。
+      //
+      // 现在只保留一套：**打开页面绝不改来源**，派发一律在
+      // `TtsAudioHandler.play()` 里按 [isForeground] 决定。
+      //
+      // ## ★v1.21.64：但「终止上一本的朗读」不能省
+      //
+      // 真机（2026-10-17 16:16）：
+      // ```
+      // 16:16:39  开始朗读：起于 21/48/3        ← EPUB 在读
+      // 16:16:42  前台[PDF]=true                 ← 用户切到了 PDF
+      //           （没有任何终止日志）            ← EPUB **还在读**
+      // 16:16:47  用户只好手动按暂停才停住
+      // ```
+      // 用户要求：「进入别的文档时当前朗读停止（记住位置），
+      // 且当前文档的控制不受上一个影响」—— 这正是 §4.100 任务 E 的换歌语义。
+      //
+      // ⚠️ 「终止朗读」和「改来源」是两回事：
+      //   · `terminateForDocumentSwitch` 会停上一本、把它位置写回盘（换歌语义）；
+      //   · 来源（通知栏派发给谁）仍由前台派发决定，这里**不主动抢**。
+      // 之前把两者一起删掉，才导致"切过去了但还在念上一本"。
+      if (TtsManager.instance.playing) {
+        TtsManager.instance.terminateForDocumentSwitch(
+          nextDocumentId: documentId,
+        );
+      }
       return;
     }
     // 换书：彻底清（旧的推进循环靠 token 失效）
@@ -649,12 +695,98 @@ class PdfReadSession extends ChangeNotifier implements AudioSessionSource {
     CrashLog.mark('位置[PDF恢复] docId=$documentId '
         '记录=$spot 落定=${_current?.pageIndex}/${_current?.sentenceIndex} '
         '页数=$pageCount');
+
+    // ⚠️ v1.21.57 记录：这里**不要**主动 `_claimAudio()`。
+    //
+    // 曾想用它修「打开 PDF 后按播放没反应」（来源停在已被终止、
+    // `hasSession=false` 的 tts-manager 上）。实测证明**在 open() 里抢来源
+    // 会引发连锁副作用**：`activate()` 会给旧来源发 `onStop()`，
+    // 而 `PdfReadSession.onStop()` 内部会 `await TtsManager.stop()`；
+    // 等来源随后再切回 TTS 时，那次 stop 恰好把刚启动的朗读停掉
+    // （用例 `★重开同一本 PDF 不得抢走 EPUB 正在读的音频` 因此变红）。
+    //
+    // v1.21.59：**不再在这里抢音频来源**（v1.21.55 / v1.21.57 / v1.21.58
+    // 反复在这里栽跟头：抢了就把另一本文档的朗读搞坏）。
+    //
+    // 现在的做法：`open()` 只登记「PDF 阅读页是前台的」，真正的派发在
+    // `TtsAudioHandler.play()` 里按**前台文档**决定 —— 详见 [setForeground]。
+    // 「打开一个页面」不再产生任何音频副作用。
     notifyListeners();
+  }
+
+  /// PDF 阅读页是不是**当前前台**（用户正在看这一本）
+  ///
+  /// ## 为什么引入这个概念（v1.21.59）
+  ///
+  /// 「切书后按耳机控制错了书」这一类问题反复出现，根因是过去一直靠
+  /// **抢音频来源**来表达"用户在看哪本"：
+  ///   · 在 `open()` 里抢 → 页面重建就抢，把正在读的书停掉（v1.21.55 事故）；
+  ///   · 不抢 → 来源留在上一本书上，按耳机还在读旧书（用户 2026-10-17 反馈）。
+  /// 两头都不对，因为「用户在看哪本」和「音频来源停在哪」本来就不是一回事。
+  ///
+  /// 现在把它显式化：阅读页在 `initState` 里标前台、在 `dispose` 里清掉；
+  /// `TtsAudioHandler.play()` 按这个标记派发。**不依赖、也不改动当前的来源**。
+  bool get isForeground => _foreground;
+  bool _foreground = false;
+
+  /// 标记本会话的阅读页是否处于前台（由 `PdfReadingPage` 的 init/dispose 调用）
+  void setForeground(bool value) {
+    if (_foreground == value) return;
+    _foreground = value;
+    CrashLog.mark('前台[PDF]=$value');
+  }
+
+  /// 用户打开了这本 PDF 的阅读页 → 把媒体来源从"空闲的 TTS"收回来。
+  ///
+  /// ## 为什么需要
+  ///
+  /// `TtsAudioHandler` 的来源可能还停在 `tts-manager` 上（上一本书只是**暂停**，
+  /// 会话仍在）。此时按耳机 / 通知栏的播放，会继续读**上一本书**
+  /// （用户 2026-10-17 反馈：「从上一本书，换到 pdf 时，用耳机控制启停控制的
+  /// 还是上一本书」）。
+  ///
+  /// ## 两道闸门（防止重演 v1.21.55 的「耳机控制失效」）
+  ///
+  /// 1. **TTS 正在朗读时绝不接管**（`playing` 为真就整个跳过）——
+  ///    正在听的朗读不能被"打开一个页面"打断。
+  /// 2. 接管前**先 `terminateForDocumentSwitch`** 清掉 TTS 会话。
+  ///    这样之后本会话被切走时，`stopSound()` 里那句无条件的
+  ///    `TtsManager.stop()` 打在**空会话**上，不会误伤新启动的朗读。
+  ///
+  /// ⚠️ v1.21.59 起这个函数**已不再被调用**。它代表"抢来源"那条老路，
+  /// 已由 [isForeground] + `TtsAudioHandler.play()` 按前台派发取代。
+  /// 保留代码只为让后来的人看到当时的两难，别再重新启用。
+  // ignore: unused_element
+  void _claimAudioFromTtsIfIdle(String documentId) {
+    if (!isActive) return;
+    final handler = audioHandler;
+    CrashLog.mark('接管[求值] pdfActive=$isActive '
+        'ttsSpeaking=${TtsManager.instance.speaking} '
+        'ttsPaused=${TtsManager.instance.paused} '
+        'ttsPlaying=${TtsManager.instance.playing} '
+        'ttsHasSession=${TtsManager.instance.hasSession} '
+        'source=${handler?.activeSource.sourceId}');
+    if (TtsManager.instance.playing) return; // 闸门 1：正在读 → 不动
+    if (handler == null) return;
+    if (identical(handler.activeSource, this)) return; // 已经是自己
+    // ⚠️ 这里**不要**调 `terminateForDocumentSwitch`。
+    //
+    // 它会把 TTS 的 `_doc` / `_lines` / `_speaking` 一起清掉 —— 那是「换书」
+    // 的力度。而这里只想要「让出音频来源」，会话内容该留着：用户切回那本书
+    // 时还要能接着读。真机日志里试过：清太狠之后回 EPUB 按播放，
+    // 连「开始朗读」都没打印、进度停在 `index=0/1`（读不起来）。
+    //
+    // 只 `_claimAudio()`：`activate()` 会通知 tts-manager `onStop()`
+    // （它只停声、保留 `_doc`），足够把来源换过来。
+    _claimAudio();
+    CrashLog.mark('接管[完成] → pdf-session');
   }
 
   /// 挂上界面（阅读页 initState）
   void attach(PdfReadSessionListener listener) {
     _listener = listener;
+    // 页面进来了 → 成为前台（v1.21.59，见 [setForeground]）
+    setForeground(true);
     final ref = _current;
     if (ref != null) listener.onSentenceChanged(ref);
   }
@@ -664,18 +796,56 @@ class PdfReadSession extends ChangeNotifier implements AudioSessionSource {
   /// 摘掉之后推进循环照常跑，只是不再回调界面（所以不会去动已销毁的
   /// PageController）。这是「退出阅读页继续读」的实现点。
   void detach(PdfReadSessionListener listener) {
-    if (identical(_listener, listener)) _listener = null;
+    if (identical(_listener, listener)) {
+      _listener = null;
+      // 页面离开了 → 不再是前台（v1.21.59，见 [setForeground]）
+      setForeground(false);
+    }
   }
 
   /// 只停声音，**保留** current / documentId / 文本层缓存
   ///
   /// 方块键与「暂停」都走这条：之后 [resume] 能从当前句接着读。
   Future<void> stopSound() async {
+    // ★v1.21.64：**先停声，再写盘**。
+    //
+    // 真机（2026-10-17 16:37，用户反馈「从 PDF 切到 EPUB 停止没立即生效，
+    // 等了一两秒才停」）：
+    // ```
+    // 16:37:48.402  位置[进入阅读页] EPUB      ← 用户已经切过去了
+    // 16:37:48.504  activate（换源）tts-manager playing=true   ← 还在响
+    // 16:37:51.278  pushState playing=false                   ← 2.7 秒后才停
+    // ```
+    // 原因：原来先 `await stopSoundLocalOnly()`（里面 `await _flushSpot()`
+    // 要写盘，慢），**之后**才 `await TtsManager.stop()` 停声。
+    // 用户感知就是「切过去了，声音还在响一两秒」。
+    //
+    // 现在把停声提到最前面并且**不等**：`stop()` 发出去引擎就会掐掉当前话语，
+    // 写盘可以慢慢来。
+    if (TtsManager.instance.isBorrowedForOther) {
+      unawaited(TtsManager.instance.stop());
+    }
+    await stopSoundLocalOnly();
+    // ★v1.21.59（用户要求核对「所有方块键按下后是否都放开媒体焦点」）：
+    // PDF 页的方块键走的正是这个方法（`PdfReadingPage._stopAndCollapse`），
+    // 而这里原来**没有**释放焦点 —— 文字档那边 `TtsManager.stop()` 会释放，
+    // PDF 这边就漏了。后果：停掉 PDF 朗读之后我们仍压着音频焦点，
+    // 别的应用（音乐 / 视频）一直出不了声，或媒体键路由异常。
+    //
+    // 只在这个"用户显式停声"的入口释放；被顶替（[onStop]）走的是
+    // [stopSoundLocalOnly]，那条**不能**释放 —— 焦点已经交给接管方了。
+    unawaited(MediaInterruptionController.instance.releaseFocus());
+  }
+
+  /// [stopSound] 的"只清自己"版本：**碰都不碰 TtsManager**
+  ///
+  /// 给 [onStop] 用 —— 那一刻音频来源已经不是本会话了，
+  /// 去停 TTS 会顶掉接管方刚领的朗读代次（见 [onStop] 的注释）。
+  Future<void> stopSoundLocalOnly() async {
     _token++; // 旧推进循环立刻失效
     _playing = false;
     _paused = false;
     await _flushSpot(); // 停声 = 用户要「记住读到哪」，防抖窗口不能再等
-    await TtsManager.instance.stop();
     _listener?.onPlaybackStateChanged();
     notifyListeners();
     _notifyAudio();
@@ -1277,7 +1447,18 @@ class PdfReadSession extends ChangeNotifier implements AudioSessionSource {
   @override
   void onStop() {
     // 被 TtsManager 顶替（用户在读 PDF 时去读 TXT）：停声但**保留位置**，
-    // 这样回到 PDF 还能接着读
-    unawaited(stopSound());
+    // 这样回到 PDF 还能接着读。
+    //
+    // ⚠️ v1.21.59：这里**必须用不碰 TTS 的版本**（[stopSoundLocalOnly]）。
+    //
+    // 原来调 [stopSound]，而它内部会 `await TtsManager.stop()` —— 那句话是
+    // **异步**的，会在 `_restart()` 刚领完新代次**之后**才落地，于是
+    // `_runBody` 在 `token != _generation` 处直接 return：
+    // 真机表现为「按了播放、图标变成暂停、但没有声音，
+    // 通知栏进度停在 `index=0/1`，日志里根本没有『开始朗读』」。
+    //
+    // 语义上也该如此：`onStop` 意味着"音频来源已经不是我了"，
+    // 此刻 TTS 正被接管方使用，我没有任何理由去停它。
+    unawaited(stopSoundLocalOnly());
   }
 }

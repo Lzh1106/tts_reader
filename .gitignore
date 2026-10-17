@@ -7,11 +7,8 @@ build/
 .flutter-plugins
 .flutter-plugins-dependencies
 
-# 本地产物：APK / 源码快照 / 打包目录（正式包以 Release 附件分发）
-dist/
-snapshots/
-release/
-probe/
+# 构建产物（APK 通过 dist/ 分发时按需保留）
+# dist/
 
 # Android
 android/.gradle/

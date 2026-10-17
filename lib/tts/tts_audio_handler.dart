@@ -4,6 +4,7 @@ import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 
 import '../services/crash_log.dart';
+import '../features/pdf_reading/pdf_read_session.dart';
 import 'audio_session_source.dart';
 import 'media_interruption.dart';
 import 'tts_manager.dart';
@@ -363,7 +364,28 @@ class TtsAudioHandler extends BaseAudioHandler {
   /// `TtsManager._restart` 里本来就是 `unawaited(requestFocus())`，这里对齐。
   @override
   Future<void> play() async {
-    _diag('play');
+    // ★v1.21.54 诊断：把「这一拍播放究竟派发给谁」一次打全。
+    //
+    // 用户报「书A暂停 → 打开书B → 恢复却读书A」，但纯 Dart 层已实测 A 完全脱离
+    // （`_speaking=false`、PDF 会话 `isPlaybackActive=false`、`_source` 已切到
+    // tts-manager）。所以真凶在本层之外，必须靠真机日志定位。
+    //
+    // 这里一次记全 5 个量，**任意一条日志都能直接读出"这一下会不会读 A"**：
+    //   · source     —— 命令派发给了谁（tts-manager / pdf-session）；
+    //   · title      —— 那个来源自己认为在读哪本书；
+    //   · docId      —— 来源持有的文档 id；
+    //   · playing/paused —— 走的是"接着播"还是"暂停态恢复"；
+    //   · sessionKey —— PDF 会话键（换书后 token 会变，能看出是不是旧会话）。
+    _diag('play source=${_source.sourceId} '
+        'title=${_source.documentTitle} '
+        'playing=${_source.playing} paused=${_source.paused} '
+        'hasSession=${_source.hasSession} '
+        'ttsDoc=${_manager.activeDocumentId} '
+        'pdfDoc=${PdfReadSession.instance.documentId} '
+        'pdfKey=${PdfReadSession.instance.sessionKey} '
+        'pdfActive=${PdfReadSession.instance.isActive} '
+        'pdfPlayback=${PdfReadSession.instance.isPlaybackActive} '
+        'identicalSourcePdf=${identical(_source, PdfReadSession.instance)}');
     // ⚠️ ColorOS（一加 / OPPO，实测设备 PKG110）把媒体键与通知栏按钮统一发成
     // `KEYCODE_MEDIA_PLAY`，**不发**标准的 `MEDIA_PLAY_PAUSE`。真机日志（v1.21.15）
     // 9 次按键全是 `媒体控制[play]`，其中三次发生在 `playing=true paused=false`
@@ -376,6 +398,38 @@ class TtsAudioHandler extends BaseAudioHandler {
       _diag('play→pause（ROM 兼容）');
       return pause();
     }
+    // ★v1.21.57：当前来源**已经没有会话**时，把播放交给还活着的那个来源。
+    //
+    // 真机日志（2026-10-17 13:11）：
+    // ```
+    // 13:11:08  打开 PDF → terminateForDocumentSwitch 清空 TTS 会话
+    //           pushState→idle（卡片消失）source=tts-manager hasSession=false
+    // 13:11:11  按播放 → 媒体控制[play source=tts-manager … hasSession=false]
+    // 13:11:11  pushState→idle（卡片消失）        ← 什么都没发生
+    // ```
+    // 播放键派给了一个没有会话的来源 → 完全没反应。
+    //
+    // ★v1.21.59：按**用户正在看哪本文档**派发，而不是"上次来源停在哪"。
+    //
+    // 背景（同一个问题反复出现，前几版都在"抢来源"上打转）：
+    //   · 用户反馈「从上一本书，换到 pdf 时，用耳机控制启停控制的还是上一本书」
+    //     —— 来源停在 tts-manager（上一本只是暂停），按耳机就继续读旧书；
+    //   · 而一旦在打开页面时把来源抢给 PDF，又会把另一本的朗读停掉
+    //     —— 真机反馈「耳机控制失效」「PDF 修好了，EPUB 又复发」。
+    //
+    // 根因：「用户在看哪本」≠「音频来源停在哪」。现在前者由阅读页显式登记
+    // （`PdfReadSession.setForeground`），这里只按登记结果派发，
+    // **不改动、也不依赖**当前来源。
+    final pdf = PdfReadSession.instance;
+    if (!identical(_source, pdf) && pdf.isActive) {
+      // PDF 页在前台，或当前来源已经空了（无会话 → 按了也没反应）
+      if (pdf.isForeground || !_source.hasSession) {
+        _diag('play→按前台派发 pdf-session '
+            '（pdfForeground=${pdf.isForeground} '
+            'sourceHasSession=${_source.hasSession}）');
+        activate(pdf);
+      }
+    }
     MediaInterruptionController.instance.notifyUserResumed();
     _source.playFromCursor();
     unawaited(MediaInterruptionController.instance.requestFocus());
@@ -383,16 +437,54 @@ class TtsAudioHandler extends BaseAudioHandler {
     syncAfterUserCommand();
   }
 
-  /// 耳机 / 通知栏「暂停」：只交给会话，**不释放音频焦点**（v1.21.15）
+  /// 耳机 / 通知栏「暂停」：按**前台文档**派发，然后停声；**不释放音频焦点**（v1.21.15）
   ///
   /// 原来的实现暂停后就 `releaseFocus()`（`setActive(false)`）。实测（ColorOS /
   /// Android 13+）：交出焦点之后，系统**可能不再把媒体键路由给本应用** ——
   /// 表现就是「暂停之后再按播放键毫无反应」。现在暂停保留焦点，
   /// 只在 [stop] / 会话结束时释放（否则别的应用会被一直压着）。
+  ///
+  /// ## ★v1.21.61：派发必须与 [play] 对称
+  ///
+  /// 用户反馈（2026-10-17）：
+  /// > 「书A朗读中 → 打开书B → 在书B界面按暂停，停的是**书A**；
+  /// >   再按播放才读书B」
+  ///
+  /// 真机日志：
+  /// ```
+  /// 15:03:37  前台[PDF]=true                     ← 用户在看 PDF(书B)
+  /// 15:03:40  媒体控制[pause] source=tts-manager … playing=true
+  ///           → `_source.pause()` 把书A停了     ← 停错了
+  /// 15:03:42  play → play→按前台派发 pdf-session  ← 要到这一步才对
+  /// ```
+  ///
+  /// 原因：`play()` 有「按前台改写 `_source`」这一步，`pause()` 从来没有 ——
+  /// 它是 v1.21.15 定稿时的直译（那时只有 TTS 一个来源，不存在派发问题）。
+  ///
+  /// 现在两边对称：
+  ///   · 前台是 PDF → 先把来源交给 PDF（`activate` 会给旧来源发 `onStop()`，
+  ///     **正在响的那本书随之停声**），再 `pause()`；
+  ///   · 前台是文字档而来源还是 PDF → 反过来交回文字档。
+  ///
+  /// 这样「按暂停」同时满足两件事：**声音真的停** + **当前来源就是你在看的那本**，
+  /// 于是紧接着按播放能直接读对书（不必按两次）。
   @override
   Future<void> pause() async {
     _diag('pause');
     MediaInterruptionController.instance.notifyUserPaused();
+    // ★按前台派发：与 [play] 的 423-432 完全对称。
+    final pdf = PdfReadSession.instance;
+    if (pdf.isActive) {
+      if (pdf.isForeground && !identical(_source, pdf)) {
+        _diag('pause→按前台派发 pdf-session（pdfForeground=true）');
+        activate(pdf);
+      } else if (!pdf.isForeground &&
+          identical(_source, pdf) &&
+          _manager.hasSession) {
+        _diag('pause→按前台派发 tts-manager（pdfForeground=false）');
+        activate(_manager);
+      }
+    }
     await _source.pause();
     // ⚠️ 暂停之后必须确认通知栏换成了"播放"图标（v1.21.39）：
     // 耳机 / 通知栏按下暂停时，来源可能不推（PDF 不挂 `_sync()` 的 listener），

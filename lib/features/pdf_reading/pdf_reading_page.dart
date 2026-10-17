@@ -101,6 +101,49 @@ class PdfReadingPage extends StatefulWidget {
   }) =>
       viewportPage == refPage;
 
+  /// 目录里「当前项」是第几条（-1 = 不标任何条目）
+  ///
+  /// ## v1.21.56：用户报「PDF 目录朗读位置图标失效」的真根因就在这个判据
+  ///
+  /// PDF 书签是**稀疏**的 —— 往往每章只有一条（如「第 20 页 第二章」），
+  /// 而朗读位置是**按页**推进的（第 21 页）。
+  /// 原来判的是 `起始页 == 当前页`（精确相等）→ **一条都命中不了**
+  /// → 整份目录没有任何标记，用户看到的就是「图标失效」。
+  /// 文字档那边章节连续、容易命中，所以这个坑只在 PDF 侧暴露。
+  ///
+  /// 现在改成「**当前所在章节**」：最后一条 `起始页 ≤ 当前页` 的条目。
+  ///
+  /// ## 为什么放在公开类上
+  ///
+  /// 与 [isViewportSyncedWithReading] 同一个理由：**必须能被单测直接打到**，
+  /// 否则这条判据再错一次也没人发现（它已经错过一次了）。
+  /// 放在私有 `_PdfReadingPageState` 里测试就引用不到。
+  ///
+  /// @param chapters 书签各自的起始页（**必须按页码升序**，`PdfOutlineReader` 保证）
+  /// @param currentPage 当前朗读 / 视图所在页（0 起）
+  /// @param pageCount 总页数（无书签时用来校验越界）
+  @visibleForTesting
+  static int currentTocIndex({
+    required List<int> chapters,
+    required int currentPage,
+    required int pageCount,
+  }) {
+    // 没有书签：目录就是「第 N 页」平铺，当前页即当前项
+    if (chapters.isEmpty) {
+      return currentPage >= 0 && currentPage < pageCount ? currentPage : -1;
+    }
+    var hit = -1;
+    for (var i = 0; i < chapters.length; i++) {
+      if (chapters[i] <= currentPage) {
+        hit = i;
+      } else {
+        break; // 书签按页码升序，往后只会更大
+      }
+    }
+    // 全都比当前页大（当前页在第一枚书签之前）→ 不标，避免指错章
+    return hit;
+  }
+
   /// **按页高累加估算"第 [pageIndex] 页顶部"的偏移**（收敛链的单一事实来源）
   ///
   /// ## 为什么必须"空缺用估算顶替、绝不中断"
@@ -449,6 +492,7 @@ class PdfReadingPageState extends State<PdfReadingPage>
     }
     _turn.dispose();
     _scroll.dispose();
+    _tocPageInput.dispose(); // 目录里的页码输入框（v1.21.56 新增）
     super.dispose();
   }
 
@@ -1988,82 +2032,155 @@ class PdfReadingPageState extends State<PdfReadingPage>
   }
 
   /// 目录：有书签列条目，没有就退回「第 N 页」
+  ///
+  /// ## v1.21.56 重写（用户要求：**换成和 EPUB 一样的样式**）
+  ///
+  /// 改了三件事，前两件是用户直接说的，第三件是修「图标失效」的真根因：
+  ///
+  /// 1. **样式对齐文字档目录**（`pages/toc_sheet.dart`）：
+  ///    标题改 `titleLarge`、加页码跳转输入框、面板固定 75% 高度、
+  ///    列表用 `Expanded`（原来用 `shrinkWrap` + `Flexible`，
+  ///    条目多时高度算得不准、还会抖）。
+  /// 2. **当前项实时跟随**：原来 `currentPage` 是打开面板那一刻取的
+  ///    **局部变量**，面板又是独立路由、**不订阅 `_session`** ——
+  ///    面板开着时朗读往前推进，那一行「当前」标识不会动。
+  ///    现在整块包进 `ListenableBuilder(listenable: _session)`。
+  /// 3. **「当前项」改成「当前所在章节」而不是精确相等** ——
+  ///    这才是用户说的「图标失效」的真根因：
+  ///    PDF 书签是**稀疏**的（往往每章只有一条，比如「第 20 页 开始第二章」），
+  ///    而朗读位置是**按页**推进的（第 21 页）。
+  ///    原来判 `pageIndex == currentPage` → 一条都对不上 → **整份目录没有任何标记**；
+  ///    文字档那边章节连续、容易命中，所以没暴露。
+  ///    现在取「最后一条 pageIndex ≤ 当前页」的条目 = 当前所在章节，
+  ///    与阅读器里「正在读哪一章」的语义一致。
   Future<void> _openToc() async {
     final pageCount = _document?.pages.length ?? 0;
     if (pageCount == 0) return;
-    final currentPage = _session.current?.pageIndex ?? 0;
+    final entries = _outline;
+    _tocPageInput.text = '${(_session.current?.pageIndex ?? 0) + 1}';
+
+    /// 当前所在的条目下标（-1 = 无可标记项）
+    ///
+    /// 判据本体在 [PdfReadingPage.currentTocIndex]（公开静态、可被单测直接打到）。
+    int currentIndexOf(int currentPage) => PdfReadingPage.currentTocIndex(
+          chapters: <int>[for (final e in entries) e.chapter],
+          currentPage: currentPage,
+          pageCount: pageCount,
+        );
+
     await showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
       builder: (sheetContext) {
-        final entries = _outline;
-        return SafeArea(
+        final theme = Theme.of(sheetContext);
+        final scheme = theme.colorScheme;
+        return SizedBox(
+          // 与文字档目录同一个高度比例
+          height: MediaQuery.sizeOf(sheetContext).height * 0.75,
           child: Column(
-            mainAxisSize: MainAxisSize.min,
             children: <Widget>[
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                 child: Row(
                   children: <Widget>[
-                    Text('目录',
-                        style: Theme.of(sheetContext).textTheme.titleMedium),
+                    Text('目录', style: theme.textTheme.titleLarge),
                     const Spacer(),
                     Text('共 $pageCount 页',
-                        style: Theme.of(sheetContext).textTheme.labelMedium),
+                        style: theme.textTheme.labelMedium),
                   ],
                 ),
               ),
-              Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: entries.isEmpty ? pageCount : entries.length,
-                  itemBuilder: (context, index) {
-                    // 没有书签：退回「第 N 页」列表（章号 == 页号）
-                    final String label;
-                    final int pageIndex;
-                    if (entries.isEmpty) {
-                      pageIndex = index;
-                      label = '第 ${index + 1} 页';
-                    } else {
-                      final entry = entries[index];
-                      pageIndex = entry.chapter;
-                      label = entry.title.isEmpty
-                          ? '第 ${pageIndex + 1} 页'
-                          : entry.title;
-                    }
-                    final selected = pageIndex == currentPage;
-                    final ColorScheme tocScheme =
-                        Theme.of(sheetContext).colorScheme;
-                    // ★当前页标识（与文字档目录同一套装饰，见 TocCurrentItem）
-                    return TocCurrentItem(
-                      active: selected,
-                      child: ListTile(
-                        dense: true,
-                        leading: Text('${pageIndex + 1}'),
-                        title: Text(
-                          label,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: selected
-                              ? TextStyle(
-                                  color: tocScheme.primary,
-                                  fontWeight: FontWeight.w600,
-                                )
-                              : null,
+              // 页码跳转：与文字档目录同款（用户要求样式一致）
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: TextField(
+                        controller: _tocPageInput,
+                        keyboardType: TextInputType.number,
+                        textInputAction: TextInputAction.go,
+                        decoration: InputDecoration(
+                          isDense: true,
+                          labelText: '跳转到第几页',
+                          helperText: '当前第 '
+                              '${(_session.current?.pageIndex ?? 0) + 1} 页，'
+                              '共 $pageCount 页',
+                          border: const OutlineInputBorder(),
                         ),
-                        trailing: selected
-                            ? Icon(
-                                TocCurrentItem.currentIcon,
-                                size: 18,
-                                color: tocScheme.primary,
-                              )
-                            : null,
-                        onTap: () {
-                          Navigator.of(sheetContext).pop();
-                          unawaited(_jumpToAndRead(pageIndex));
-                        },
+                        onSubmitted: (_) => _jumpFromToc(sheetContext),
                       ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: () => _jumpFromToc(sheetContext),
+                      child: const Text('跳转'),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              // ★订阅会话：面板开着时朗读继续推进，这一行也要跟着动
+              Expanded(
+                child: ListenableBuilder(
+                  listenable: _session,
+                  builder: (context, _) {
+                    final currentPage = _session.current?.pageIndex ?? 0;
+                    final activeIndex = currentIndexOf(currentPage);
+                    return ListView.builder(
+                      itemCount: entries.isEmpty ? pageCount : entries.length,
+                      itemBuilder: (context, index) {
+                        // 没有书签：退回「第 N 页」列表（章号 == 页号）
+                        final String label;
+                        final int pageIndex;
+                        if (entries.isEmpty) {
+                          pageIndex = index;
+                          label = '第 ${index + 1} 页';
+                        } else {
+                          final entry = entries[index];
+                          pageIndex = entry.chapter;
+                          label = entry.title.isEmpty
+                              ? '第 ${pageIndex + 1} 页'
+                              : entry.title;
+                        }
+                        final selected = index == activeIndex;
+                        // ★当前项标识：与文字档目录共用同一套装饰
+                        //（`TocCurrentItem`：淡色圆角背景 + 加粗 + graphic_eq）
+                        return TocCurrentItem(
+                          active: selected,
+                          child: ListTile(
+                            dense: true,
+                            leading: Text('${pageIndex + 1}'),
+                            title: Text(
+                              label,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: selected
+                                  ? TextStyle(
+                                      color: scheme.primary,
+                                      fontWeight: FontWeight.w600,
+                                    )
+                                  : null,
+                            ),
+                            subtitle: Text(
+                              '第 ${pageIndex + 1} 页',
+                              style: theme.textTheme.labelSmall,
+                            ),
+                            trailing: selected
+                                ? Icon(
+                                    TocCurrentItem.currentIcon,
+                                    size: 18,
+                                    color: scheme.primary,
+                                  )
+                                : null,
+                            onTap: () {
+                              Navigator.of(sheetContext).pop();
+                              unawaited(_jumpToAndRead(pageIndex));
+                            },
+                          ),
+                        );
+                      },
                     );
                   },
                 ),
@@ -2073,6 +2190,20 @@ class PdfReadingPageState extends State<PdfReadingPage>
         );
       },
     );
+  }
+
+  /// 目录里的「跳转到第几页」输入框（与文字档目录同款）
+  final TextEditingController _tocPageInput = TextEditingController();
+
+  /// 从目录的输入框跳页：**只移动视图，不激活朗读**（与点条目同一语义）
+  void _jumpFromToc(BuildContext sheetContext) {
+    final pageCount = _document?.pages.length ?? 0;
+    final typed = int.tryParse(_tocPageInput.text.trim());
+    if (typed == null || pageCount <= 0) return;
+    // 越界夹取到有效范围（不报错、不回到开头）
+    final target = (typed - 1).clamp(0, pageCount - 1);
+    Navigator.of(sheetContext).pop();
+    unawaited(_jumpToAndRead(target));
   }
 
   /// 目录跳转：**只移动视图，不激活朗读**（v1.21.43 · 语义 B）

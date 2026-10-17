@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:flutter_tts/flutter_tts.dart';
 
@@ -204,6 +204,27 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
   /// 本次 speak 的提交时刻（时长判据用；null = 当前没有在飞的 speak）
   DateTime? _speakIssuedAt;
 
+  /// **作废令牌**：`stop()` / `pause()` / 新一轮 `speak()` 各自 +1。
+  ///
+  /// ## 为什么必须有它（v1.21.54 修的真实缺陷）
+  ///
+  /// [speak] 里的重投机制会在提交被丢弃时**每 150ms 重投一次、最多 8 次**
+  /// （合计约 1.2 秒）。原来这个重投**不检查"这次朗读是否已经作废"** ——
+  /// 于是下面这条时序会把**旧书的正文**念出来：
+  ///
+  /// ```
+  /// t=0    书A 最后一句进入重投（提交被丢弃）
+  /// t=50   用户切到书B → stop()  → _completePending() + _tts.stop()
+  /// t=150  重投到点，把【A 的文本】再次交给系统 → 念出来的仍是书A
+  /// ```
+  ///
+  /// 这正是用户报的「书A暂停 → 打开书B → 恢复却读书A」：与在哪一页、
+  /// 点哪个按钮、哪本书都无关 —— 因为是**引擎自己把旧文本又送了一遍**。
+  ///
+  /// 修法：每次 speak 记下当时的 [_generation]，重投前比对；
+  /// 不一致就**放弃本次重投并让它安静结束**（不报错、不推进游标）。
+  int _generation = 0;
+
   /// 本次 speak 已经丢弃掉几个「假完成」
   int _fakeCompleteDrops = 0;
 
@@ -215,6 +236,8 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
     final done = Completer<void>();
     _pending = done;
     _fakeCompleteDrops = 0;
+    // 本次朗读的代次：之后的 stop() / pause() / 新 speak() 都会让它失效
+    final int myGeneration = ++_generation;
     int attempts = 0;
 
     // ① 提交：**不 await、也不把它的完成当成「读完」**。
@@ -230,6 +253,13 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
     //   于是把「提交即返回」当成「读完」→ 主循环疯狂推进
     //   （真机诊断：R5 = 192、R4 = 195、R2 = 0，speak 全是 ms=0 ok=true）。
     void submit() {
+      // ★代次校验：这次朗读已经被 stop() / pause() / 新 speak() 作废了，
+      // 就**不再提交**（否则旧书的文本会在切书之后被念出来，见 [_generation]）。
+      if (myGeneration != _generation || _disposed) {
+        // 安静结束：不报错（用户已完成切书，这不是失败），也不推进游标
+        if (!done.isCompleted) done.complete();
+        return;
+      }
       attempts++;
       _speakIssuedAt = DateTime.now();
       unawaited(
@@ -278,6 +308,7 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
 
   @override
   Future<void> pause() async {
+    _generation++; // 作废在飞的重投：暂停之后不该再有旧文本被提交
     _completePending(); // 唤醒上层循环，游标保持在当前单元
     try {
       await _tts.pause();
@@ -288,6 +319,10 @@ class SystemTtsEngine implements TtsEngine, LocalEngineHost {
 
   @override
   Future<void> stop() async {
+    // ★作废在飞的重投（v1.21.54）：切书 / 停止之后，任何**旧的**文本
+    // 都不能再被提交给系统 —— 否则用户会听到"读回上一本书"。
+    // 只递增代次是不够的，还要让 `_tts.stop()` 把系统侧队列也清掉。
+    _generation++;
     _completePending();
     try {
       await _tts.stop();

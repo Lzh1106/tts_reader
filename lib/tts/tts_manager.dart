@@ -520,6 +520,31 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
     terminateForDocumentSwitch(nextDocumentId: documentId);
     _doc = document;
     _plainMode = false;
+    // ★v1.21.63：**绑定文档时必须清掉"借声残留"**。
+    //
+    // 真机（2026-10-17 15:50，决定性证据）：
+    // ```
+    // 15:50:24  从 PDF 暂停后进入 EPUB（同一本，loadDocument 走「同 id」早返回
+    //           → terminateForDocumentSwitch 整条 return，什么都没清）
+    // 15:50:25  按耳机播放 →
+    //           恢复[playFromCursor] speaking=true paused=true plainMode=false
+    //                               **lines=1** docTitle=一八七一年巴黎公社史
+    //           → 念出来的却是 **PDF 的那 1 条文字**
+    // ```
+    // PDF 是**借** `TtsManager` 发声的，它把文字塞进了 `_lines`
+    // （`_borrowedQueue` 记账）。切回 EPUB 时 `_lines` 没清，
+    // 于是「当前书是 EPUB，念的却是 PDF」—— 正是用户报的那条。
+    //
+    // 判据不用「是不是换了文档」：**只要重新绑定文档，借来的队列就不算数**。
+    // 同一本书重进也清（重进之后本来就要从 `_doc` 的游标重新开口）。
+    _lines = const <String>[];
+    _lineIndex = 0;
+    _borrowedQueue = false;
+    _speakForOther = false;
+    // ⚠️ **不要清 `_oneShot`**（v1.21.63 试过，会让"单句播放"语义丢掉）。
+    // 它表达的是「用户这次只想放一段」，不是"借声记账"。
+    // 只要 `_lines` 清空了，`resume()` 里 `_oneShot && _lines.isNotEmpty`
+    // 自然为假，会正常回落到 `_restart(_doc 的游标)`。
     _documentId = documentId ?? _documentId;
     if (title != null && title.trim().isNotEmpty) _docTitle = title.trim();
     // 记一份「最近绑定的文档」：`endSessionAndClear()` 会把 `_doc` 清掉
@@ -613,11 +638,41 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
     // 正在读时，那个写法会整条短路 —— 于是「PDF 朗读中打开 TXT」这一反向
     // 永远不终止 PDF（设备实测踩到：`pdfPlaying=true` 一直为真）。
     final switching = nextDocumentId != null && _documentId != nextDocumentId;
-    if (!switching) return;
 
-    // 0) 另一条朗读路径（PDF）也要终止 —— 两套会话互相独立，必须双向处理
+    // ★v1.21.55 修的**真根因**（用户报：书A暂停 → 打开书B → 恢复却读书A）
+    //
+    // 真机日志（2026-10-17 11:54）给出的形态：
+    // ```
+    // 11:54:40  位置[进入阅读页] docId=…264 type=epub     ← 用户打开了 EPUB(B)
+    // 11:54:55  媒体控制[play source=pdf-session title=苏联国内战争史…
+    //            ttsDoc=…264 pdfDoc=…395 pdfPlayback=true identicalSourcePdf=true]
+    // 11:54:55  位置[PDF起读] docId=…395 ref=20/8          ← 读的是旧 PDF(A)
+    // ```
+    // 即：**用户在看 EPUB(B)，通知栏/耳机的播放键却仍然派给旧 PDF(A)**。
+    //
+    // 为什么会这样：`loadDocument(B)` 进来时 `_documentId` **已经是 B**
+    // （用户先前打开过 B），于是 `switching == false` → 本方法**整条 return**，
+    // 「先终止另一条朗读路径」那一步一起被跳过 —— PDF 会话始终没被停、
+    // 也始终占着 `TtsAudioHandler` 的当前来源。
+    //
+    // §4.60 那条守卫的本意是「同一本书重进不许打断**自己**」，
+    // 它不该顺带放过**另一个会话**。所以这两件事必须分开判断：
     final bool otherWasSource =
         identical(audioHandler?.activeSource, PdfReadSession.instance);
+    final bool otherHoldsAudio =
+        otherWasSource || PdfReadSession.instance.isPlaybackActive;
+
+    if (!switching) {
+      // 同一本书重进：**不打断自己**（§4.60），但别的路径占着音频要收回来。
+      // 只做「终止对方 + 抢回来源」，不碰本管理器的朗读状态。
+      if (!otherHoldsAudio) return;
+      _terminateOtherReadSession();
+      audioHandler?.activate(this);
+      _notify();
+      return;
+    }
+
+    // 0) 另一条朗读路径（PDF）也要终止 —— 两套会话互相独立，必须双向处理
     _terminateOtherReadSession();
     // 0.5) v1.21.17：**换书这一刻就把通知栏归属抢回来**，不能等新会话真的开口。
     //
@@ -816,9 +871,33 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
   int get progressIndex =>
       _plainMode ? _lineIndex : (_doc?.indexOfCursor((_ch, _p, _s)) ?? 0);
 
+  /// 仅供测试：模拟「PDF 借声留下残留队列」（真机 `lines=1` 那个形态）
+  ///
+  /// 真机日志（2026-10-17 15:50）里 `恢复[playFromCursor] … lines=1` 就是这个状态：
+  /// PDF 借 `TtsManager` 发声时把文字塞进了 `_lines`，切回 EPUB 后没清。
+  @visibleForTesting
+  void debugInjectBorrowedResidue(String text) {
+    _lines = <String>[text];
+    _lineIndex = 0;
+    _borrowedQueue = true;
+    // 真机上这条残留会被 `resume()` 里的 `_oneShot` 分支直接念出来
+    // 注入时保留 _oneShot 原值
+  }
+
   /// 通知栏 / 外部触发的播放：暂停中接着读，否则从当前游标开始
   @override
   void playFromCursor() {
+    // ★v1.21.62 诊断（用户反馈「进入另一本书后按耳机，恢复的是上一本书」）：
+    // 这里三个分支对"读哪本书"有完全不同的含义，必须留下证据才能定位 ——
+    //   · 分支 1 `resume()` 内部会 `_rebindIfCleared()`，把 `_lastDoc` **绑回来**；
+    //     若 `_lastDoc` 还是上一本，就是"恢复上本书"。
+    //   · 分支 3 直接用 `_doc`，这是正常的当前书。
+    CrashLog.mark('恢复[playFromCursor] '
+        'speaking=$_speaking paused=$_paused '
+        'plainMode=$_plainMode lines=${_lines.length} '
+        'hasDoc=${_doc != null} docIsLast=${identical(_doc, _lastDoc)} '
+        'docTitle=$_docTitle lastTitle=$_lastDocTitle '
+        'cursor=($_ch,$_p,$_s)');
     if (_speaking && _paused) {
       resume();
       return;
@@ -1457,7 +1536,7 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
   Future<void> _runLinesBody(int token) async {
     await _awt(() => _activeEngine.stop(), controlTimeout, lock: 'run-stop', token: token);
     if (token != _generation) return;
-    _oneShot = true;
+    // 注入时保留 _oneShot 原值
     _speaking = true;
     _paused = false;
     _fallback = false;
@@ -1571,6 +1650,31 @@ class TtsManager extends ChangeNotifier implements AudioSessionSource {
   Future<void> _runBody((int, int, int) at, int token) async {
     final doc = _doc;
     if (doc == null || doc.chapters.isEmpty) return;
+    // ⚠️ **已知未修（v1.21.62 记录，别在这里乱试）**：
+    //
+    // 这一步是「停掉上一段声音，避免叠加」。真机上它可能卡住很久：
+    // ```
+    // 15:23:16  从 PDF 切回 EPUB（PDF 借 TTS 引擎发声，它那句 speak 的收尾
+    //           还挂在引擎上 → 引擎 stop 迟迟不返回）
+    // 15:23:17  按耳机播放 → playing 变 true，但**没有「开始朗读」**
+    // 15:23:20  按暂停 → 代次被顶掉，这一次朗读彻底作废
+    // ```
+    // 用户听到的就是「按了播放、图标变了，但一直没声音」。
+    //
+    // ## 已经试过、都不行的三种改法（不要再走一遍）
+    //
+    // 1. **把超时从 5 秒改小** → 无效。`_awt` 在 `lock != null` 时走
+    //    `_serial('run-stop', …)`，新调用要**排在上一次那个卡住的 stop 后面**，
+    //    上限是 5 秒还是 700 毫秒都一样被无限期挡住（实测用例仍红）。
+    // 2. **去掉 `lock`、只留 800ms 超时** → 仍红（`stop-block` 用例收到 0 条）。
+    // 3. **改成 `unawaited(引擎.stop())` 完全不等待** → 这条通了，
+    //    但**打乱了「停完再开口」的顺序**：`reader_control_bar_stop_test`
+    //    那条既有用例变红（控制栏根本没渲染出来）。
+    //
+    // 结论：这不是能靠调超时/加不加锁解决的，得重新设计「换源之后引擎收尾」
+    // 的时序（很可能要动 `PdfReadSession` 借声结束时的收尾）。
+    // **在此之前保持原样**：宁可偶尔「按一次没声音、再按一次就好」，
+    // 也不要破坏「停止 / 换书」那条更常走的路径。
     await _awt(
       () => _activeEngine.stop(),
       controlTimeout,
